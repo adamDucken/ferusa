@@ -1,0 +1,32 @@
+/target
+**/target/
+node_modules
+*.enc
+*.salt
+peer.id
+.DS_Store
+.env
+.env.*
+!.env.example
+review.md
+AGENTS.md
+# Generated build outputs
+**/build/
+**/.gradle/
+**/.tauri/
+app/.svelte-kit/
+app/build/
+app/src-tauri/gen/schemas/
+cli/fuzz-*.log
+
+# Release binaries and signing material belong outside Git
+*.apk
+*.aab
+*.idsig
+*.jks
+*.keystore
+
+# Local network diagnostics may contain private addresses and traffic
+captures/
+*.pcap
+*.pcapng
