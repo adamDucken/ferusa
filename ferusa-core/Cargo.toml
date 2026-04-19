@@ -1,0 +1,20 @@
+[package]
+name    = "ferusa-core"
+version = "0.1.0"
+edition = "2021"
+authors = ["adam <adamducken@gmail.com>"]
+description = "Shared cryptographic protocol and message types for Ferusa"
+license = "MIT"
+
+[dependencies]
+serde            = { version = "1",  features = ["derive"] }
+serde_json       = "1"
+uuid             = { version = "1",  features = ["v4", "serde"] }
+thiserror        = "2"
+zeroize          = { version = "1",  features = ["derive"] }
+argon2           = "0.5"
+chacha20poly1305 = "0.10"
+hkdf             = "0.12"
+sha2             = "0.10"
+rand             = "0.9"
+ring             = "0.17"
