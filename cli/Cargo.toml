@@ -1,0 +1,42 @@
+[package]
+name    = "cli"
+version = "0.1.0"
+edition = "2021"
+authors = ["adam <adamducken@gmail.com>"]
+description = "Unix CLI for the Ferusa two-factor password vault"
+license = "MIT"
+
+[[bin]]
+name = "ferusa"
+path = "src/main.rs"
+
+[features]
+default = []
+dev-2fa-stub = []
+
+[dependencies]
+ferusa-core = { path = "../ferusa-core" }
+serde       = { version = "1", features = ["derive"] }
+serde_json  = "1"
+uuid        = { version = "1", features = ["v4", "serde"] }
+tokio       = { version = "1", features = ["full"] }
+anyhow      = "1"
+thiserror   = "2"
+clap        = { version = "4", features = ["derive"] }
+rpassword   = "7"
+dirs        = "5"
+zeroize     = { version = "1", features = ["derive"] }
+rand        = "0.9"
+iroh        = "0.98"
+hex         = "0.4"
+qr2term     = "0.3"
+log         = "0.4"
+simplelog   = "0.12"
+rustyline   = "14"
+
+
+[dev-dependencies]
+assert_cmd = "2.0"
+predicates = "3.0"
+proptest = "1"
+tempfile = "3.8"
