@@ -1,0 +1,61 @@
+[package]
+name = "cli-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+cli = { path = ".." }
+ferusa-core = { path = "../../ferusa-core" }
+iroh = "0.98"
+libfuzzer-sys = "0.4"
+serde_json = "1"
+tempfile = "3.8"
+
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "clipboard_command"
+path = "fuzz_targets/clipboard_command.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cli_args"
+path = "fuzz_targets/cli_args.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pairing_files"
+path = "fuzz_targets/pairing_files.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "private_file"
+path = "fuzz_targets/private_file.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "vault_blob"
+path = "fuzz_targets/vault_blob.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wire_message"
+path = "fuzz_targets/wire_message.rs"
+test = false
+doc = false
+bench = false
