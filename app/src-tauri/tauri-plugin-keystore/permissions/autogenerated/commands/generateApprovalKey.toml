@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-generateApprovalKey"
+description = "Enables the generateApprovalKey command without any pre-configured scope."
+commands.allow = ["generateApprovalKey"]
+
+[[permission]]
+identifier = "deny-generateApprovalKey"
+description = "Denies the generateApprovalKey command without any pre-configured scope."
+commands.deny = ["generateApprovalKey"]

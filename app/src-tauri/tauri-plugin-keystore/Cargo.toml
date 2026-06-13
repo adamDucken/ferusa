@@ -1,0 +1,21 @@
+[package]
+name = "tauri-plugin-keystore"
+version = "0.1.0"
+edition = "2021"
+authors = ["adam <adamducken@gmail.com>"]
+build = "build.rs"
+links = "tauri-plugin-keystore"
+description = "Ferusa Android Keystore encrypted secret storage bridge"
+license = "MIT"
+
+[lib]
+name = "tauri_plugin_keystore"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+tauri = { version = "2", default-features = false }
+thiserror = "2"
+
+[build-dependencies]
+tauri-plugin = { version = "2", features = ["build"] }

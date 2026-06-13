@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-deleteApprovalKey"
+description = "Enables the deleteApprovalKey command without any pre-configured scope."
+commands.allow = ["deleteApprovalKey"]
+
+[[permission]]
+identifier = "deny-deleteApprovalKey"
+description = "Denies the deleteApprovalKey command without any pre-configured scope."
+commands.deny = ["deleteApprovalKey"]
