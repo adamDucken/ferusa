@@ -1,0 +1,48 @@
+[package]
+name = "app"
+version = "0.1.0"
+description = "Android approval companion for the Ferusa two-factor password vault"
+authors = ["adam <adamducken@gmail.com>"]
+license = "MIT"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "ferusa_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[dependencies]
+ferusa-core       = { path = "../../ferusa-core" }
+serde             = { version = "1", features = ["derive"] }
+serde_json        = "1"
+uuid              = { version = "1", features = ["v4", "serde"] }
+tokio             = { version = "1", features = ["full"] }
+anyhow            = "1"
+thiserror         = "2"
+tauri             = { version = "2", features = [] }
+tauri-plugin-biometric = { version = "2", optional = true }
+iroh              = "0.98"
+hex               = "0.4"
+argon2            = "0.5"
+rand              = "0.9"
+zeroize           = { version = "1", features = ["derive"] }
+tauri-plugin-log = "2"
+tauri-plugin-keystore = { path = "./tauri-plugin-keystore" }
+log = "0.4"
+[features]
+default        = ["biometric"]
+# Enable Android biometric authentication.
+biometric      = ["tauri-plugin-biometric"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dev-dependencies]
+ring = "0.17"
+
+[target.'cfg(target_os = "android")'.dependencies]
+tauri-plugin-barcode-scanner = "2"
