@@ -1,0 +1,34 @@
+{
+  "name": "app",
+  "version": "0.1.0",
+  "description": "Android approval companion for the Ferusa two-factor password vault",
+  "author": "adam <adamducken@gmail.com>",
+  "type": "module",
+  "scripts": {
+    "dev": "vite dev",
+    "build": "vite build",
+    "preview": "vite preview",
+    "check:csp": "node scripts/check-csp.mjs",
+    "test:security-flows": "node --test scripts/security-flow.test.mjs",
+    "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
+    "check:watch": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --watch",
+    "tauri": "tauri"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "@tauri-apps/api": "^2",
+    "@tauri-apps/plugin-barcode-scanner": "~2.4.4",
+    "@tauri-apps/plugin-log": "~2.8.0",
+    "lucide-svelte": "^1.0.1"
+  },
+  "devDependencies": {
+    "@sveltejs/adapter-static": "^3.0.6",
+    "@sveltejs/kit": "^2.9.0",
+    "@sveltejs/vite-plugin-svelte": "^5.0.0",
+    "@tauri-apps/cli": "^2",
+    "svelte": "^5.0.0",
+    "svelte-check": "^4.0.0",
+    "typescript": "~5.6.2",
+    "vite": "^6.0.3"
+  }
+}
