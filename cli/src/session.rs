@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::io::Read;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -8,7 +9,9 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
-use ferusa_core::crypto::{combine_vault_key, decrypt_vault, derive_keys, encrypt_vault};
+use ferusa_core::crypto::{
+    combine_vault_key, decrypt_vault, derive_keys, encrypt_vault, VAULT_BLOB_OVERHEAD_BYTES,
+};
 use ferusa_core::types::{Vault, VaultAction, MAX_VAULT_PLAINTEXT_BYTES};
 
 use crate::interface::ui;
@@ -53,15 +56,20 @@ pub struct SessionState {
     pub vault_lock: Option<VaultLock>,
 }
 
+const MAX_VAULT_ENCRYPTED_BYTES: usize = MAX_VAULT_PLAINTEXT_BYTES + VAULT_BLOB_OVERHEAD_BYTES;
+
 fn load_vault_blob(paths: &Paths) -> Result<ferusa_core::crypto::EncryptedBlob> {
-    let metadata = std::fs::metadata(&paths.vault_enc).context("stat vault.enc")?;
-    if metadata.len() > MAX_VAULT_PLAINTEXT_BYTES as u64 {
+    let file = std::fs::File::open(&paths.vault_enc).context("open vault.enc")?;
+    let mut blob_bytes = Vec::new();
+    file.take(MAX_VAULT_ENCRYPTED_BYTES as u64 + 1)
+        .read_to_end(&mut blob_bytes)
+        .context("read vault.enc")?;
+    if blob_bytes.len() > MAX_VAULT_ENCRYPTED_BYTES {
         bail!(
-            "vault.enc exceeds the {} MiB size limit",
-            MAX_VAULT_PLAINTEXT_BYTES / (1024 * 1024)
+            "vault.enc exceeds the {}-byte encrypted size limit",
+            MAX_VAULT_ENCRYPTED_BYTES
         );
     }
-    let blob_bytes = std::fs::read(&paths.vault_enc).context("read vault.enc")?;
     ferusa_core::crypto::EncryptedBlob::from_bytes(&blob_bytes).context("parse vault.enc")
 }
 
@@ -341,4 +349,115 @@ pub async fn lock_session(state: &SharedState) {
     let mut guard = state.lock().await;
     *guard = None;
     info!("[ferusa:cli]: lock_session: session cleared");
+}
+
+#[cfg(test)]
+mod size_limit_tests {
+    use super::*;
+    use ferusa_core::types::Entry;
+
+    fn temp_paths() -> (tempfile::TempDir, Paths) {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        let paths = Paths {
+            data_dir: p.to_path_buf(),
+            vault_enc: p.join("vault.enc"),
+            vault_salt: p.join("vault.salt"),
+            peer_id: p.join("peer.id"),
+            phone_id: p.join("phone.id"),
+            hmac_key: p.join("hmac.key"),
+            clipboard_cmd: p.join("clipboard.cmd"),
+        };
+        (dir, paths)
+    }
+
+    fn vault_with_serialized_size(size: usize) -> Vault {
+        let mut vault = Vault {
+            entries: (0..8)
+                .map(|_| Entry {
+                    id: Uuid::nil(),
+                    title: "entry".into(),
+                    username: None,
+                    password: "password".into(),
+                    url: None,
+                    notes: Some(String::new()),
+                    tags: Vec::new(),
+                    created_at: 0,
+                    updated_at: 0,
+                })
+                .collect(),
+            ..Vault::default()
+        };
+        let mut remaining = size - serde_json::to_vec(&vault).unwrap().len();
+        for entry in &mut vault.entries {
+            let len = remaining.min(1024 * 1024);
+            entry.notes = Some("x".repeat(len));
+            remaining -= len;
+        }
+        assert_eq!(remaining, 0);
+        assert_eq!(serde_json::to_vec(&vault).unwrap().len(), size);
+        vault.validate().unwrap();
+        vault
+    }
+
+    #[test]
+    fn accepted_saves_reopen_around_encrypted_size_boundary() {
+        let (_dir, paths) = temp_paths();
+        for size in [
+            MAX_VAULT_PLAINTEXT_BYTES - VAULT_BLOB_OVERHEAD_BYTES,
+            MAX_VAULT_PLAINTEXT_BYTES - VAULT_BLOB_OVERHEAD_BYTES + 1,
+            MAX_VAULT_PLAINTEXT_BYTES - 1,
+            MAX_VAULT_PLAINTEXT_BYTES,
+        ] {
+            let written = save_vault_snapshot(
+                vault_with_serialized_size(size),
+                Zeroizing::new([7; 32]),
+                [8; 16],
+                paths.vault_enc.clone(),
+            )
+            .unwrap();
+            assert_eq!(written, size + VAULT_BLOB_OVERHEAD_BYTES);
+            let blob = load_vault_blob(&paths).unwrap();
+            let reopened = decrypt_vault_blob(&blob, &[7; 32]).unwrap();
+            assert_eq!(serde_json::to_vec(&reopened).unwrap().len(), size);
+        }
+    }
+
+    #[test]
+    fn oversized_save_preserves_existing_vault() {
+        let (_dir, paths) = temp_paths();
+        save_vault_snapshot(
+            Vault::default(),
+            Zeroizing::new([7; 32]),
+            [8; 16],
+            paths.vault_enc.clone(),
+        )
+        .unwrap();
+        let previous = std::fs::read(&paths.vault_enc).unwrap();
+        let err = save_vault_snapshot(
+            vault_with_serialized_size(MAX_VAULT_PLAINTEXT_BYTES + 1),
+            Zeroizing::new([7; 32]),
+            [8; 16],
+            paths.vault_enc.clone(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("serialized vault exceeds"));
+        assert_eq!(std::fs::read(&paths.vault_enc).unwrap(), previous);
+    }
+
+    #[test]
+    fn encrypted_and_decrypted_limits_reject_one_extra_byte() {
+        let (_dir, paths) = temp_paths();
+        let blob =
+            encrypt_vault(&[7; 32], [8; 16], &vec![0; MAX_VAULT_PLAINTEXT_BYTES + 1]).unwrap();
+        let bytes = blob.to_bytes();
+        assert_eq!(bytes.len(), MAX_VAULT_ENCRYPTED_BYTES + 1);
+        std::fs::write(&paths.vault_enc, bytes).unwrap();
+        let err = load_vault_blob(&paths)
+            .err()
+            .expect("oversized encrypted vault");
+        assert!(err.to_string().contains("encrypted size limit"));
+        let err = decrypt_vault_blob(&blob, &[7; 32]).unwrap_err();
+        assert!(err.to_string().contains("decrypted vault exceeds"));
+    }
 }

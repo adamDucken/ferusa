@@ -406,6 +406,12 @@ fn clear_uncommitted_pending<S: PairingStore>(store: &S) -> Result<()> {
 }
 
 fn begin_pending_pairing<S: PairingStore>(store: &S, pairing_id: uuid::Uuid) -> Result<()> {
+    finalize_active_activation(store)?;
+    // Once published, the desktop may have durably prepared this generation.
+    // Only a caller that knows the handshake never started may discard it.
+    if load_generation_id(store, PENDING_PAIRING_GENERATION)?.is_some() {
+        bail!("pairing is pending; resume the original desktop transaction before retrying setup");
+    }
     clear_uncommitted_pending(store)?;
     save_generation_id(store, STAGING_PAIRING_GENERATION, pairing_id)
 }
@@ -559,16 +565,29 @@ pub async fn mark_pending_pairing_committed_blocking<R: Runtime + 'static>(
         .context("storage task panicked")?
 }
 
-pub fn clear_pending_pairing<R: Runtime>(app: &AppHandle<R>) -> Result<()> {
+fn abort_unstarted_pairing<S: PairingStore>(store: &S, pairing_id: uuid::Uuid) -> Result<()> {
+    for key in [STAGING_PAIRING_GENERATION, PENDING_PAIRING_GENERATION] {
+        if load_generation_id(store, key)?.is_some_and(|stored| stored != pairing_id) {
+            bail!("refusing to clear a different pairing generation");
+        }
+    }
+    clear_uncommitted_pending(store)
+}
+
+/// Only call before starting the network handshake: the desktop cannot yet be prepared.
+pub fn clear_pending_pairing<R: Runtime>(app: &AppHandle<R>, pairing_id: uuid::Uuid) -> Result<()> {
     info!("[ferusa:app]: clear_pending_pairing start");
     let _guard = storage_guard();
-    clear_uncommitted_pending(&AppPairingStore(app))?;
+    abort_unstarted_pairing(&AppPairingStore(app), pairing_id)?;
     info!("[ferusa:app]: clear_pending_pairing complete");
     Ok(())
 }
 
-pub async fn clear_pending_pairing_blocking<R: Runtime + 'static>(app: AppHandle<R>) -> Result<()> {
-    task::spawn_blocking(move || clear_pending_pairing(&app))
+pub async fn clear_pending_pairing_blocking<R: Runtime + 'static>(
+    app: AppHandle<R>,
+    pairing_id: uuid::Uuid,
+) -> Result<()> {
+    task::spawn_blocking(move || clear_pending_pairing(&app, pairing_id))
         .await
         .context("storage task panicked")?
 }
@@ -666,6 +685,41 @@ pub async fn pairing_generation_cli_node_id_blocking<R: Runtime + 'static>(
     pairing_id: uuid::Uuid,
 ) -> Result<Option<[u8; 32]>> {
     task::spawn_blocking(move || pairing_generation_cli_node_id(&app, pairing_id))
+        .await
+        .context("storage task panicked")?
+}
+
+fn is_referenced_pairing_cli_node_id_in_store<S: PairingStore>(
+    store: &S,
+    cli_node_id: &[u8; 32],
+) -> Result<bool> {
+    for key in [
+        ACTIVE_PAIRING_GENERATION,
+        PENDING_PAIRING_GENERATION,
+        COMMITTED_PAIRING_GENERATION,
+    ] {
+        if let Some(pairing_id) = load_generation_id(store, key)? {
+            if load_generation(store, pairing_id)?.cli_node_id == *cli_node_id {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+pub fn is_referenced_pairing_cli_node_id<R: Runtime>(
+    app: &AppHandle<R>,
+    cli_node_id: &[u8; 32],
+) -> Result<bool> {
+    let _guard = storage_guard();
+    is_referenced_pairing_cli_node_id_in_store(&AppPairingStore(app), cli_node_id)
+}
+
+pub async fn is_referenced_pairing_cli_node_id_blocking<R: Runtime + 'static>(
+    app: AppHandle<R>,
+    cli_node_id: [u8; 32],
+) -> Result<bool> {
+    task::spawn_blocking(move || is_referenced_pairing_cli_node_id(&app, &cli_node_id))
         .await
         .context("storage task panicked")?
 }
@@ -974,10 +1028,11 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        activate_generation, activate_pending_generation, approval_key_alias,
-        begin_pending_pairing, cleanup_retiring_generation, clear_pairing_store,
-        clear_uncommitted_pending, commit_pending_generation, is_setup_in_store,
-        load_generation_id, load_key_bound_generation, pairing_generation_key, save_generation_id,
+        abort_unstarted_pairing, activate_generation, activate_pending_generation,
+        approval_key_alias, begin_pending_pairing, cleanup_retiring_generation,
+        clear_pairing_store, clear_uncommitted_pending, commit_pending_generation,
+        is_referenced_pairing_cli_node_id_in_store, is_setup_in_store, load_generation_id,
+        load_key_bound_generation, pairing_generation_key, save_generation_id,
         store_pending_pairing_generation, update_pin_attempt_state_with, PairingGeneration,
         PairingStore, PinAttemptState, PinAttemptStateWrite, ACTIVE_PAIRING_GENERATION,
         COMMITTED_PAIRING_GENERATION, PAIRING_GENERATION_VERSION, PENDING_PAIRING_GENERATION,
@@ -1083,7 +1138,7 @@ mod tests {
         }
     }
 
-    fn stage_and_commit(store: &TestStore, pairing_id: uuid::Uuid) {
+    fn stage_pending(store: &TestStore, pairing_id: uuid::Uuid) {
         begin_pending_pairing(store, pairing_id).unwrap();
         let public_key = store.add_approval_key(pairing_id);
         store_pending_pairing_generation(
@@ -1097,6 +1152,10 @@ mod tests {
             &[0x22; 32],
         )
         .unwrap();
+    }
+
+    fn stage_and_commit(store: &TestStore, pairing_id: uuid::Uuid) {
+        stage_pending(store, pairing_id);
         commit_pending_generation(store, pairing_id).unwrap();
     }
 
@@ -1105,6 +1164,26 @@ mod tests {
         stage_and_commit(store, pairing_id);
         activate_pending_generation(store).unwrap();
         pairing_id
+    }
+
+    #[test]
+    fn referenced_active_pending_and_committed_endpoints_are_recovery_peers() {
+        for state in ["active", "pending", "committed"] {
+            let store = TestStore::default();
+            let pairing_id = uuid::Uuid::new_v4();
+            match state {
+                "active" => {
+                    stage_and_commit(&store, pairing_id);
+                    activate_pending_generation(&store).unwrap();
+                }
+                "pending" => stage_pending(&store, pairing_id),
+                "committed" => stage_and_commit(&store, pairing_id),
+                _ => unreachable!(),
+            }
+
+            assert!(is_referenced_pairing_cli_node_id_in_store(&store, &[0x22; 32]).unwrap());
+            assert!(!is_referenced_pairing_cli_node_id_in_store(&store, &[0x33; 32]).unwrap());
+        }
     }
 
     #[test]
@@ -1415,6 +1494,77 @@ mod tests {
         assert!(store.has_generation(active));
         assert!(store.has_approval_key(active));
         assert!(!store.has_approval_key(stale));
+    }
+
+    #[test]
+    fn setup_retry_preserves_prepared_desktop_transaction_until_recovery() {
+        for replacement in [false, true] {
+            let store = TestStore::default();
+            let old = replacement.then(|| activate_initial_generation(&store));
+            let original = uuid::Uuid::new_v4();
+            stage_pending(&store, original);
+            // The desktop has persisted Prepared, but its PairingCommit never arrived.
+            let before_retry = store.secrets.borrow().clone();
+
+            let error = begin_pending_pairing(&store, uuid::Uuid::new_v4()).unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("resume the original desktop transaction"));
+            assert_eq!(*store.secrets.borrow(), before_retry);
+            assert!(store.has_approval_key(original));
+            assert_eq!(
+                load_generation_id(&store, ACTIVE_PAIRING_GENERATION).unwrap(),
+                old
+            );
+
+            // Recovery uses only persisted state, as after restarting both devices.
+            load_key_bound_generation(&store, original).unwrap();
+            commit_pending_generation(&store, original).unwrap();
+            activate_generation(&store, original).unwrap();
+            assert_eq!(
+                load_generation_id(&store, ACTIVE_PAIRING_GENERATION).unwrap(),
+                Some(original)
+            );
+        }
+    }
+
+    #[test]
+    fn setup_retry_can_replace_unpublished_staging_generation() {
+        let store = TestStore::default();
+        let stale = uuid::Uuid::new_v4();
+        begin_pending_pairing(&store, stale).unwrap();
+        store.add_approval_key(stale);
+        let replacement = uuid::Uuid::new_v4();
+
+        begin_pending_pairing(&store, replacement).unwrap();
+
+        assert!(!store.has_approval_key(stale));
+        assert_eq!(
+            load_generation_id(&store, STAGING_PAIRING_GENERATION).unwrap(),
+            Some(replacement)
+        );
+    }
+
+    #[test]
+    fn pre_handshake_cleanup_only_removes_its_own_generation() {
+        let store = TestStore::default();
+        let old = activate_initial_generation(&store);
+        let stale = uuid::Uuid::new_v4();
+        begin_pending_pairing(&store, stale).unwrap();
+        let current = uuid::Uuid::new_v4();
+        stage_pending(&store, current);
+        let before_abort = store.secrets.borrow().clone();
+
+        assert!(abort_unstarted_pairing(&store, stale).is_err());
+        assert_eq!(*store.secrets.borrow(), before_abort);
+        assert!(store.has_approval_key(current));
+
+        abort_unstarted_pairing(&store, current).unwrap();
+        assert!(!store.has_generation(current));
+        assert!(!store.has_approval_key(current));
+        assert!(store.has_generation(old));
+        assert!(store.has_approval_key(old));
+        begin_pending_pairing(&store, uuid::Uuid::new_v4()).unwrap();
     }
 
     #[test]

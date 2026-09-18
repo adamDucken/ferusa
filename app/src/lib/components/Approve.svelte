@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { onDestroy } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
   import { Check, X } from "lucide-svelte";
   import { formatInvokeError, getInvokeError } from "$lib/errors";
@@ -24,16 +25,19 @@
   }: {
     request: RequestPayload | null;
     retryMessage?: string;
-    onapproved?: () => void;
-    ondenied?: () => void;
-    onfailed?: (payload: { reason: string }) => void;
-    onlocked?: () => void;
+    onapproved?: (request: RequestPayload) => void;
+    ondenied?: (request: RequestPayload) => void;
+    onfailed?: (request: RequestPayload, payload: { reason: string }) => void;
+    onlocked?: (request: RequestPayload) => void;
   } = $props();
 
   let stage = $state<Stage>("confirm");
   let loading = $state(false);
   let pinValue = $state("");
   let pinError = $state("");
+  let confirmedRequest: RequestPayload | null = null;
+  let disposed = false;
+  onDestroy(() => { disposed = true; });
 
   let requiredLength = $derived(request?.pin_digits ?? 4);
 
@@ -47,6 +51,8 @@
   }
 
   function goToPin() {
+    if (!request) return;
+    confirmedRequest = { ...request };
     stage = "pin";
     pinValue = "";
     pinError = "";
@@ -55,22 +61,26 @@
 
   function focusPinInput() {
     setTimeout(() => {
+      if (disposed) return;
       document.querySelector<HTMLInputElement>('[data-pin-input="approve"]')?.focus();
     }, 50);
   }
 
   async function submitPin(finalPin: string) {
-    if (finalPin.length !== requiredLength) return;
+    const submittedRequest = confirmedRequest;
+    if (disposed || loading || !submittedRequest || finalPin.length !== requiredLength
+      || JSON.stringify(submittedRequest) !== JSON.stringify(request)) return;
     loading = true;
     try {
       await invoke("approve_request", {
         payload: {
-          request_id: request?.request_id,
+          request_id: submittedRequest.request_id,
           pin: finalPin,
         },
       });
-      onapproved?.();
+      if (!disposed) onapproved?.(submittedRequest);
     } catch (e: any) {
+      if (disposed) return;
       const err = getInvokeError(e);
       const msg = formatInvokeError(e);
       const isWrongPin = err.code === "app.pin.incorrect";
@@ -82,9 +92,9 @@
         pinValue = "";
         focusPinInput();
       } else if (isLocked) {
-        onlocked?.();
+        onlocked?.(submittedRequest);
       } else {
-        onfailed?.({ reason: `Approval failed: ${msg}` });
+        onfailed?.(submittedRequest, { reason: `Approval failed: ${msg}` });
       }
     } finally {
       loading = false;
@@ -92,14 +102,16 @@
   }
 
   async function deny() {
+    if (disposed || loading || !request) return;
+    const submittedRequest = { ...request };
     loading = true;
     try {
       await invoke("deny_request", {
-        requestId: request?.request_id,
+        requestId: submittedRequest.request_id,
       });
-      ondenied?.();
+      if (!disposed) ondenied?.(submittedRequest);
     } catch (e: any) {
-      onfailed?.({ reason: `Deny failed: ${formatInvokeError(e)}` });
+      if (!disposed) onfailed?.(submittedRequest, { reason: `Deny failed: ${formatInvokeError(e)}` });
     } finally {
       loading = false;
     }

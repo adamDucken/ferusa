@@ -248,10 +248,6 @@ async fn current_authenticated_approval_alias(state: &AppState) -> Option<String
     }
 }
 
-async fn mark_approval_key_authenticated(state: &AppState) {
-    *state.approval_key_authenticated_at.lock().await = Some(Instant::now());
-}
-
 async fn clear_approval_key_authenticated(state: &AppState) {
     *state.approval_key_authenticated_at.lock().await = None;
 }
@@ -260,10 +256,10 @@ async fn refresh_approval_key_auth<R: Runtime>(
     app: &AppHandle<R>,
     state: &AppState,
     reason: &str,
+    generation: u64,
 ) -> Result<()> {
     require_biometric(app, reason).await?;
-    mark_approval_key_authenticated(state).await;
-    Ok(())
+    state.mark_approval_key_authenticated(generation).await
 }
 
 async fn ensure_approval_key_auth<R: Runtime>(
@@ -282,7 +278,8 @@ async fn ensure_approval_key_auth<R: Runtime>(
         return Ok(());
     }
 
-    refresh_approval_key_auth(app, state, reason).await
+    let generation = state.authentication_generation().await?;
+    refresh_approval_key_auth(app, state, reason, generation).await
 }
 
 fn approval_key_auth_error_details(details: &str) -> bool {
@@ -759,15 +756,20 @@ async fn send_pairing_recovery_ack(
         .context("finish pairing recovery acknowledgement")
 }
 
-async fn send_pong(send: &mut iroh::endpoint::SendStream) -> anyhow::Result<()> {
+async fn send_pong(send: &mut iroh::endpoint::SendStream, timeout: Duration) -> anyhow::Result<()> {
     let bytes = FerusaMessage::Pong { path_info: None }
         .encode()
         .context("encode pong")?;
-    tokio::time::timeout(INBOUND_FRAME_TIMEOUT, send.write_all(&bytes))
+    tokio::time::timeout(timeout, send.write_all(&bytes))
         .await
         .context("timed out sending pong")?
         .context("send pong")?;
     send.finish().context("finish pong")
+}
+
+fn remaining_unauthenticated_timeout(deadline: Instant, maximum: Duration) -> Option<Duration> {
+    let remaining = deadline.checked_duration_since(Instant::now())?;
+    (!remaining.is_zero()).then(|| remaining.min(maximum))
 }
 
 pub async fn serve_connection<R: Runtime + 'static>(
@@ -776,41 +778,62 @@ pub async fn serve_connection<R: Runtime + 'static>(
     app_handle: AppHandle<R>,
 ) {
     let mut authenticated = false;
+    let authentication_deadline = Instant::now() + UNAUTHENTICATED_INBOUND_IDLE_TIMEOUT;
 
     loop {
         debug!("[ferusa:app]: accepting bi-directional stream...");
-        let idle_timeout = if authenticated {
-            INBOUND_IDLE_TIMEOUT
+        let accept_timeout = if authenticated {
+            Some(INBOUND_IDLE_TIMEOUT)
         } else {
-            UNAUTHENTICATED_INBOUND_IDLE_TIMEOUT
+            remaining_unauthenticated_timeout(
+                authentication_deadline,
+                UNAUTHENTICATED_INBOUND_IDLE_TIMEOUT,
+            )
         };
-        let (mut send, mut recv) = match tokio::time::timeout(idle_timeout, conn.accept_bi()).await
-        {
-            Ok(Ok(s)) => {
-                debug!("[ferusa:app]: stream accepted");
-                s
-            }
-            Ok(Err(e)) => {
-                warn!("[ferusa:app]: accept_bi ended: {}", e);
-                break;
-            }
-            Err(_) => {
-                info!("[ferusa:app]: closing idle inbound connection");
-                conn.close(0u32.into(), b"idle connection");
-                break;
-            }
+        let Some(accept_timeout) = accept_timeout else {
+            info!("[ferusa:app]: closing connection after authentication deadline");
+            conn.close(0u32.into(), b"authentication deadline");
+            break;
         };
+        let (mut send, mut recv) =
+            match tokio::time::timeout(accept_timeout, conn.accept_bi()).await {
+                Ok(Ok(s)) => {
+                    debug!("[ferusa:app]: stream accepted");
+                    s
+                }
+                Ok(Err(e)) => {
+                    warn!("[ferusa:app]: accept_bi ended: {}", e);
+                    break;
+                }
+                Err(_) => {
+                    info!("[ferusa:app]: closing idle inbound connection");
+                    conn.close(0u32.into(), b"idle connection");
+                    break;
+                }
+            };
 
         debug!("[ferusa:app]: reading request data...");
-        let data = match tokio::time::timeout(INBOUND_FRAME_TIMEOUT, recv.read_to_end(1024 * 1024))
-            .await
-        {
+        let read_timeout = if authenticated {
+            Some(INBOUND_FRAME_TIMEOUT)
+        } else {
+            remaining_unauthenticated_timeout(authentication_deadline, INBOUND_FRAME_TIMEOUT)
+        };
+        let Some(read_timeout) = read_timeout else {
+            info!("[ferusa:app]: closing connection after authentication deadline");
+            conn.close(0u32.into(), b"authentication deadline");
+            break;
+        };
+        let data = match tokio::time::timeout(read_timeout, recv.read_to_end(1024 * 1024)).await {
             Ok(Ok(d)) => {
                 debug!("[ferusa:app]: read {} bytes", d.len());
                 d
             }
             Ok(Err(e)) => {
                 error!("[ferusa:app]: read error: {}", e);
+                if !authenticated {
+                    conn.close(0u32.into(), b"invalid unauthenticated frame");
+                    break;
+                }
                 continue;
             }
             Err(_) => {
@@ -826,13 +849,37 @@ pub async fn serve_connection<R: Runtime + 'static>(
         );
         match FerusaMessage::decode(&data) {
             Ok(FerusaMessage::Ping) => {
-                let paired_peer =
-                    authenticated || is_authorized_auth_peer(&conn, &app_handle).await;
+                let paired_peer = if authenticated {
+                    true
+                } else if let Some(timeout) = remaining_unauthenticated_timeout(
+                    authentication_deadline,
+                    UNAUTHENTICATED_INBOUND_IDLE_TIMEOUT,
+                ) {
+                    tokio::time::timeout(timeout, is_authorized_auth_peer(&conn, &app_handle))
+                        .await
+                        .unwrap_or(false)
+                } else {
+                    false
+                };
+                if paired_peer {
+                    authenticated = true;
+                }
                 debug!(
                     "[ferusa:app]: received ping; replying pong paired_peer={}",
                     paired_peer
                 );
-                if let Err(e) = send_pong(&mut send).await {
+                let Some(write_timeout) = (if authenticated {
+                    Some(INBOUND_FRAME_TIMEOUT)
+                } else {
+                    remaining_unauthenticated_timeout(
+                        authentication_deadline,
+                        INBOUND_FRAME_TIMEOUT,
+                    )
+                }) else {
+                    conn.close(0u32.into(), b"authentication deadline");
+                    break;
+                };
+                if let Err(e) = send_pong(&mut send, write_timeout).await {
                     warn!(
                         "[ferusa:app]: closing connection after pong failure: {:#}",
                         e
@@ -840,21 +887,35 @@ pub async fn serve_connection<R: Runtime + 'static>(
                     conn.close(0u32.into(), b"pong failed");
                     break;
                 }
-                if paired_peer {
-                    authenticated = true;
-                } else {
+                if !paired_peer {
                     conn.close(0u32.into(), b"unauthenticated ping complete");
                     break;
                 }
             }
             Ok(FerusaMessage::PairingCommit(commit)) => {
-                if !is_authorized_pairing_recovery_peer(
-                    &conn,
-                    app_handle.clone(),
-                    commit.pairing_id,
-                )
-                .await
-                {
+                let authorization_timeout = if authenticated {
+                    Some(INBOUND_FRAME_TIMEOUT)
+                } else {
+                    remaining_unauthenticated_timeout(
+                        authentication_deadline,
+                        UNAUTHENTICATED_INBOUND_IDLE_TIMEOUT,
+                    )
+                };
+                let authorized = if let Some(timeout) = authorization_timeout {
+                    tokio::time::timeout(
+                        timeout,
+                        is_authorized_pairing_recovery_peer(
+                            &conn,
+                            app_handle.clone(),
+                            commit.pairing_id,
+                        ),
+                    )
+                    .await
+                    .unwrap_or(false)
+                } else {
+                    false
+                };
+                if !authorized {
                     conn.close(0u32.into(), b"unauthorized pairing recovery");
                     break;
                 }
@@ -881,13 +942,29 @@ pub async fn serve_connection<R: Runtime + 'static>(
                 }
             }
             Ok(FerusaMessage::PairingActivate(activate)) => {
-                if !is_authorized_pairing_recovery_peer(
-                    &conn,
-                    app_handle.clone(),
-                    activate.pairing_id,
-                )
-                .await
-                {
+                let authorization_timeout = if authenticated {
+                    Some(INBOUND_FRAME_TIMEOUT)
+                } else {
+                    remaining_unauthenticated_timeout(
+                        authentication_deadline,
+                        UNAUTHENTICATED_INBOUND_IDLE_TIMEOUT,
+                    )
+                };
+                let authorized = if let Some(timeout) = authorization_timeout {
+                    tokio::time::timeout(
+                        timeout,
+                        is_authorized_pairing_recovery_peer(
+                            &conn,
+                            app_handle.clone(),
+                            activate.pairing_id,
+                        ),
+                    )
+                    .await
+                    .unwrap_or(false)
+                } else {
+                    false
+                };
+                if !authorized {
                     conn.close(0u32.into(), b"unauthorized pairing recovery");
                     break;
                 }
@@ -920,7 +997,22 @@ pub async fn serve_connection<R: Runtime + 'static>(
                 }
             }
             Ok(FerusaMessage::Request(req)) => {
-                if !is_authorized_auth_peer(&conn, &app_handle).await {
+                let authorization_timeout = if authenticated {
+                    Some(INBOUND_FRAME_TIMEOUT)
+                } else {
+                    remaining_unauthenticated_timeout(
+                        authentication_deadline,
+                        UNAUTHENTICATED_INBOUND_IDLE_TIMEOUT,
+                    )
+                };
+                let authorized = if let Some(timeout) = authorization_timeout {
+                    tokio::time::timeout(timeout, is_authorized_auth_peer(&conn, &app_handle))
+                        .await
+                        .unwrap_or(false)
+                } else {
+                    false
+                };
+                if !authorized {
                     conn.close(0u32.into(), b"unauthorized auth request");
                     break;
                 }
@@ -1075,9 +1167,17 @@ pub async fn serve_connection<R: Runtime + 'static>(
             }
             Ok(other) => {
                 warn!("[ferusa:app]: unexpected message variant: {:?}", other);
+                if !authenticated {
+                    conn.close(0u32.into(), b"unexpected unauthenticated message");
+                    break;
+                }
             }
             Err(e) => {
                 error!("[ferusa:app]: decode error: {}", e);
+                if !authenticated {
+                    conn.close(0u32.into(), b"malformed unauthenticated message");
+                    break;
+                }
             }
         }
     }
@@ -1255,7 +1355,9 @@ pub async fn setup_complete<R: Runtime>(
         Ok(public_key) => public_key,
         Err(e) => {
             error!("[ferusa:app]: approval key generation failed: {}", e);
-            if let Err(clear_err) = storage::clear_pending_pairing_blocking(app.clone()).await {
+            if let Err(clear_err) =
+                storage::clear_pending_pairing_blocking(app.clone(), pairing_id).await
+            {
                 warn!(
                         "[ferusa:app]: clearing staging pairing after key generation failure failed: {}",
                         clear_err
@@ -1291,7 +1393,9 @@ pub async fn setup_complete<R: Runtime>(
     .await
     {
         error!("[ferusa:app]: pending pairing store failed: {}", e);
-        if let Err(clear_err) = storage::clear_pending_pairing_blocking(app.clone()).await {
+        if let Err(clear_err) =
+            storage::clear_pending_pairing_blocking(app.clone(), pairing_id).await
+        {
             warn!(
                 "[ferusa:app]: clearing staging pairing after pending store failure failed: {}",
                 clear_err
@@ -1304,7 +1408,17 @@ pub async fn setup_complete<R: Runtime>(
     }
     debug!("[ferusa:app]: pending pairing secrets stored");
 
-    ensure_approval_key_auth(&app, state.inner(), "Approve").await?;
+    if let Err(err) = ensure_approval_key_auth(&app, state.inner(), "Approve").await {
+        if let Err(clear_err) =
+            storage::clear_pending_pairing_blocking(app.clone(), pairing_id).await
+        {
+            warn!(
+                "[ferusa:app]: clearing pending pairing after authentication failure failed: {}",
+                clear_err
+            );
+        }
+        return Err(err);
+    }
 
     let ready_signature = match storage::sign_approval_blocking(
         app.clone(),
@@ -1318,7 +1432,9 @@ pub async fn setup_complete<R: Runtime>(
             let err = map_approval_sign_error(e);
             let err = handle_signed_response_error(state.inner(), err).await;
             error!("[ferusa:app]: activation signature failed: {}", err);
-            if let Err(clear_err) = storage::clear_pending_pairing_blocking(app.clone()).await {
+            if let Err(clear_err) =
+                storage::clear_pending_pairing_blocking(app.clone(), pairing_id).await
+            {
                 warn!(
                     "[ferusa:app]: clearing pending pairing after signing failure failed: {}",
                     clear_err
@@ -1329,7 +1445,9 @@ pub async fn setup_complete<R: Runtime>(
     };
     if !verify_pairing_ready_signature(&approval_public_key_der, pairing_id, &ready_signature) {
         error!("[ferusa:app]: activation signature does not match generated approval key");
-        if let Err(clear_err) = storage::clear_pending_pairing_blocking(app.clone()).await {
+        if let Err(clear_err) =
+            storage::clear_pending_pairing_blocking(app.clone(), pairing_id).await
+        {
             warn!(
                 "[ferusa:app]: clearing pending pairing after signature verification failure failed: {}",
                 clear_err
@@ -1368,7 +1486,7 @@ pub async fn setup_complete<R: Runtime>(
         error!("[ferusa:app]: pairing failed: {}", e);
         // Keep staged state after the network handshake starts. The CLI may
         // have durably recorded `Prepared` and must be able to resume commit.
-        // A later setup attempt clears stale uncommitted state before staging.
+        // A later setup attempt must preserve it until desktop recovery finishes.
         return Err(AppError::Core(FerusaError::Network {
             operation: "connect",
             details: e.to_string(),
@@ -1439,7 +1557,7 @@ pub async fn authorize_pairing_replacement<R: Runtime>(
 ) -> Result<()> {
     info!("[ferusa:app]: authorize_pairing_replacement: authorizing replacement");
     let mut payload = payload;
-    *state.pairing_replacement_authorized_at.lock().await = None;
+    let generation = state.begin_pairing_replacement().await?;
 
     validate_pin(&payload.pin4, 4).map_err(|e| {
         error!(
@@ -1463,7 +1581,7 @@ pub async fn authorize_pairing_replacement<R: Runtime>(
         }
     })?;
 
-    refresh_approval_key_auth(&app, state.inner(), "Replace pairing").await?;
+    refresh_approval_key_auth(&app, state.inner(), "Replace pairing", generation.0).await?;
 
     let mut stored = match storage::load_secrets_blocking(app.clone()).await {
         Ok(stored) => stored,
@@ -1560,15 +1678,14 @@ pub async fn authorize_pairing_replacement<R: Runtime>(
         }
     }
 
-    *state.pairing_replacement_authorized_at.lock().await = Some(Instant::now());
+    state.complete_pairing_replacement(generation).await?;
     info!("[ferusa:app]: authorize_pairing_replacement: authorization passed");
     Ok(())
 }
 
 #[command]
 pub async fn cancel_pairing_replacement(state: State<'_, AppState>) -> Result<()> {
-    *state.pairing_replacement_authorized_at.lock().await = None;
-    *state.setup_pairing_code.lock().await = None;
+    state.cancel_pairing_replacement().await;
     info!("[ferusa:app]: pairing replacement authorization cancelled");
     Ok(())
 }
@@ -1580,11 +1697,8 @@ pub async fn biometric_unlock<R: Runtime>(
     pending: State<'_, PendingReq>,
 ) -> Result<()> {
     info!("[ferusa:app]: biometric_unlock");
-    if !state.is_foreground() {
-        return Err(AppError::SessionExpired);
-    }
-
-    refresh_approval_key_auth(&app, state.inner(), "Unlock").await?;
+    let generation = state.authentication_generation().await?;
+    refresh_approval_key_auth(&app, state.inner(), "Unlock", generation).await?;
 
     debug!("[ferusa:app]: loading secrets");
     let stored = match storage::load_secrets_blocking(app.clone()).await {
@@ -1598,10 +1712,11 @@ pub async fn biometric_unlock<R: Runtime>(
     };
     debug!("[ferusa:app]: secrets loaded from storage");
 
-    *state.secrets.lock().await = Some(stored.into_state_secrets());
+    let generation = state
+        .complete_unlock(generation, stored.into_state_secrets())
+        .await?;
     debug!("[ferusa:app]: secrets written to app state");
 
-    let generation = state.start_session().await;
     schedule_session_expiry(app.clone(), pending.inner().clone(), generation);
     debug!("[ferusa:app]: biometric_unlock: session timer started");
 
@@ -1633,7 +1748,7 @@ pub async fn set_app_foreground<R: Runtime>(
     pending: State<'_, PendingReq>,
     foreground: bool,
 ) -> Result<()> {
-    state.set_foreground(foreground);
+    state.set_foreground(foreground).await;
     if !foreground {
         expire_session(app, state.inner(), pending.inner(), "app_backgrounded").await;
     }
@@ -1912,15 +2027,15 @@ mod tests {
     use super::{
         active_cooldown_remaining_ms, auth_session_is_current,
         consume_pairing_replacement_authorization, cooldown_duration_ms,
-        existing_setup_requires_replacement_authorization, mark_approval_key_authenticated,
-        pairing_generation_matches, pairing_replacement_authorization_is_current,
-        pending_request_is_expired, pin_retry_limit_reached, record_pin_failure_state,
+        existing_setup_requires_replacement_authorization, pairing_generation_matches,
+        pairing_replacement_authorization_is_current, pending_request_is_expired,
+        pin_retry_limit_reached, record_pin_failure_state, remaining_unauthenticated_timeout,
         run_argon2_job, sanitize_request_display_field, send_pong, AppState, PendingRequestPayload,
         PinKind, PinVerificationOutcome, APPROVAL_KEY_AUTH_TTL, AUTH_SESSION_TTL,
         PAIRING_REPLACEMENT_AUTHORIZATION_TTL, PENDING_REQUEST_TTL, PIN_FAILURES_BEFORE_COOLDOWN,
         REQUEST_DISPLAY_FIELD_MAX_CHARS,
     };
-    use crate::peer::AppPeer;
+    use crate::peer::{AppPeer, INBOUND_FRAME_TIMEOUT};
     use crate::storage::PinAttemptState;
     use ferusa_core::auth::{AuthRequest, AuthResponse};
     use ferusa_core::transport::{FerusaMessage, FERUSA_ALPN};
@@ -1988,7 +2103,9 @@ mod tests {
                 FerusaMessage::decode(&ping).unwrap(),
                 FerusaMessage::Ping
             ));
-            send_pong(&mut ping_send).await.unwrap();
+            send_pong(&mut ping_send, INBOUND_FRAME_TIMEOUT)
+                .await
+                .unwrap();
 
             let (mut approval_send, mut approval_recv) = conn.accept_bi().await.unwrap();
             let request = approval_recv.read_to_end(1024 * 1024).await.unwrap();
@@ -2133,6 +2250,20 @@ mod tests {
     }
 
     #[test]
+    fn unauthenticated_timeout_uses_one_absolute_deadline() {
+        let deadline = Instant::now() + Duration::from_millis(100);
+        assert!(
+            remaining_unauthenticated_timeout(deadline, Duration::from_secs(3))
+                .is_some_and(|remaining| remaining <= Duration::from_millis(100))
+        );
+        assert!(remaining_unauthenticated_timeout(
+            Instant::now() - Duration::from_millis(1),
+            Duration::from_secs(3),
+        )
+        .is_none());
+    }
+
+    #[test]
     fn approval_key_auth_expires_after_ttl() {
         assert!(super::approval_key_auth_is_current(Instant::now()));
         assert!(!super::approval_key_auth_is_current(
@@ -2145,7 +2276,8 @@ mod tests {
         let state = AppState::new();
 
         assert!(state.approval_key_authenticated_at.lock().await.is_none());
-        mark_approval_key_authenticated(&state).await;
+        state.set_foreground(true).await;
+        state.mark_approval_key_authenticated(0).await.unwrap();
         assert!(state
             .approval_key_authenticated_at
             .lock()
@@ -2161,20 +2293,21 @@ mod tests {
     #[tokio::test]
     async fn lock_clears_approval_key_auth_marker() {
         let state = AppState::new();
-        mark_approval_key_authenticated(&state).await;
+        state.set_foreground(true).await;
+        state.mark_approval_key_authenticated(0).await.unwrap();
 
         state.lock().await;
 
         assert!(state.approval_key_authenticated_at.lock().await.is_none());
     }
 
-    #[test]
-    fn foreground_state_defaults_closed_and_tracks_lifecycle() {
+    #[tokio::test]
+    async fn foreground_state_defaults_closed_and_tracks_lifecycle() {
         let state = AppState::new();
         assert!(!state.is_foreground());
-        state.set_foreground(true);
+        state.set_foreground(true).await;
         assert!(state.is_foreground());
-        state.set_foreground(false);
+        state.set_foreground(false).await;
         assert!(!state.is_foreground());
     }
 

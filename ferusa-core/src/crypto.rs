@@ -30,6 +30,9 @@ const VAULT_BLOB_V2_HEADER_LEN: usize = VAULT_BLOB_MAGIC_V2.len() + 16 + 24;
 const AEAD_TAG_LEN: usize = 16;
 const LEGACY_V1_MIN_LEN: usize = 16 + 24 + AEAD_TAG_LEN;
 
+/// Bytes added to plaintext by the v2 header and authentication tag.
+pub const VAULT_BLOB_OVERHEAD_BYTES: usize = VAULT_BLOB_V2_HEADER_LEN + AEAD_TAG_LEN;
+
 /// On-disk layout: ["FERUSA2\0"][salt 16b][nonce 24b][ciphertext + 16b tag]
 pub struct EncryptedBlob {
     salt: [u8; 16],

@@ -19,6 +19,8 @@ const ALLOWED_CLIPBOARD_PROGRAMS: &[&str] = &[
 ];
 const DEFAULT_CLEAR_TIMEOUT_SECS: u64 = 30;
 const MAX_CLEAR_TIMEOUT_SECS: u64 = 60 * 60;
+const MAX_COMMAND_BYTES: usize = 4096;
+const MAX_PASSWORD_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClipboardClearStatus {
@@ -37,8 +39,11 @@ pub fn copy_password(password: &str) -> Result<ClipboardClearStatus> {
         return Ok(ClipboardClearStatus::Disabled);
     }
     let argv = parse_clipboard_command(&command)?;
-    if !supports_ownership_check(&argv) {
-        return Ok(ClipboardClearStatus::Unsupported(argv[0].clone()));
+    if expiry_commands(&argv).is_err() {
+        return Ok(ClipboardClearStatus::Unsupported(format!(
+            "{} with its configured options",
+            argv[0]
+        )));
     }
     let reader = ownership_reader_program(&argv);
     if reader != argv[0] && !executable_is_available(reader) {
@@ -47,7 +52,7 @@ pub fn copy_password(password: &str) -> Result<ClipboardClearStatus> {
             argv[0]
         )));
     }
-    if spawn_clear_helper(password, timeout).is_err() {
+    if spawn_clear_helper(password, &command, timeout).is_err() {
         return Ok(ClipboardClearStatus::Unsupported(
             "the automatic clipboard clear helper".into(),
         ));
@@ -91,13 +96,68 @@ pub fn write_clear_timeout(paths: &Paths, seconds: u64) -> Result<()> {
     .context("write clipboard clear timeout")
 }
 
-fn supports_ownership_check(argv: &[String]) -> bool {
-    argv.first().is_some_and(|program| {
-        matches!(
-            program.as_str(),
-            "wl-copy" | "xclip" | "xsel" | "pbcopy" | "termux-clipboard-set"
-        )
-    })
+// Only accept options whose target can be preserved for both reading and clearing.
+fn expiry_commands(argv: &[String]) -> Result<(Vec<String>, Vec<String>)> {
+    let program = argv.first().context("empty clipboard command")?.as_str();
+    let mut target = Vec::new();
+    let mut args = argv[1..].iter();
+    while let Some(arg) = args.next() {
+        match (program, arg.as_str()) {
+            ("wl-copy", "-p" | "--primary") => target.push("--primary".into()),
+            ("wl-copy", "-s" | "--seat") => {
+                target.push("--seat".into());
+                target.push(args.next().context("missing clipboard seat")?.clone());
+            }
+            ("wl-copy", option) if option.starts_with("--seat=") => {
+                if option == "--seat=" {
+                    bail!("missing clipboard seat");
+                }
+                target.push(arg.clone());
+            }
+            ("xclip", "-selection") => {
+                let selection = args.next().context("missing clipboard selection")?;
+                if !matches!(selection.as_str(), "primary" | "secondary" | "clipboard") {
+                    bail!("unsupported clipboard selection");
+                }
+                target.extend([arg.clone(), selection.clone()]);
+            }
+            ("xclip", "-display") => {
+                target.extend([arg.clone(), args.next().context("missing display")?.clone()]);
+            }
+            ("xclip", "-i" | "-in") | ("xsel", "-i" | "--input") => {}
+            ("xsel", "-p" | "--primary" | "-s" | "--secondary" | "-b" | "--clipboard") => {
+                target.push(arg.clone());
+            }
+            ("xsel", "--display") => {
+                target.extend([arg.clone(), args.next().context("missing display")?.clone()]);
+            }
+            ("pbcopy", "-pboard") => {
+                let board = args.next().context("missing pasteboard")?;
+                if !matches!(board.as_str(), "general" | "ruler" | "find" | "font") {
+                    bail!("unsupported pasteboard");
+                }
+                target.extend([arg.clone(), board.clone()]);
+            }
+            _ => bail!("unsupported clipboard expiry option"),
+        }
+    }
+    let (reader, read_option, clear_option) = match program {
+        "wl-copy" => ("wl-paste", Some("--no-newline"), Some("--clear")),
+        "xclip" => ("xclip", Some("-o"), None),
+        "xsel" => ("xsel", Some("--output"), None),
+        "pbcopy" => ("pbpaste", None, None),
+        "termux-clipboard-set" => ("termux-clipboard-get", None, None),
+        _ => bail!("unsupported clipboard expiry program"),
+    };
+    let read = std::iter::once(reader.to_owned())
+        .chain(target.clone())
+        .chain(read_option.map(str::to_owned))
+        .collect();
+    let clear = std::iter::once(program.to_owned())
+        .chain(target)
+        .chain(clear_option.map(str::to_owned))
+        .collect();
+    Ok((read, clear))
 }
 
 fn ownership_reader_program(argv: &[String]) -> &str {
@@ -115,7 +175,42 @@ fn executable_is_available(program: &str) -> bool {
     })
 }
 
-fn spawn_clear_helper(password: &str, after_secs: u64) -> Result<()> {
+fn helper_payload(password: &str, command: &str) -> Result<Zeroizing<Vec<u8>>> {
+    if command.len() > MAX_COMMAND_BYTES || password.len() > MAX_PASSWORD_BYTES {
+        bail!("clipboard helper input is too large");
+    }
+    let mut payload = Zeroizing::new(Vec::new());
+    payload.extend_from_slice(&(command.len() as u32).to_le_bytes());
+    payload.extend_from_slice(command.as_bytes());
+    payload.extend_from_slice(password.as_bytes());
+    Ok(payload)
+}
+
+fn helper_snapshot(payload: &[u8]) -> Result<(Vec<String>, &[u8])> {
+    let header: [u8; 4] = payload
+        .get(..4)
+        .context("missing helper header")?
+        .try_into()?;
+    let len = u32::from_le_bytes(header) as usize;
+    if len > MAX_COMMAND_BYTES {
+        bail!("clipboard command is too large");
+    }
+    let command = std::str::from_utf8(
+        payload
+            .get(4..4 + len)
+            .context("truncated helper command")?,
+    )?;
+    let expected = &payload[4 + len..];
+    if expected.len() > MAX_PASSWORD_BYTES {
+        bail!("clipboard ownership value is too large");
+    }
+    let argv = parse_clipboard_command(command)?;
+    expiry_commands(&argv)?;
+    Ok((argv, expected))
+}
+
+fn spawn_clear_helper(password: &str, command: &str, after_secs: u64) -> Result<()> {
+    let payload = helper_payload(password, command)?;
     let executable =
         std::env::current_exe().context("resolve clipboard clear helper executable")?;
     let mut child = Command::new(executable)
@@ -131,28 +226,23 @@ fn spawn_clear_helper(password: &str, after_secs: u64) -> Result<()> {
         .stdin
         .take()
         .context("open clipboard clear helper stdin")?
-        .write_all(password.as_bytes())
+        .write_all(&payload)
         .context("send clipboard ownership value to clear helper")?;
     Ok(())
 }
 
 pub fn run_clear_helper(after_secs: u64) -> Result<()> {
     validate_clear_timeout(after_secs)?;
-    let mut expected = Zeroizing::new(Vec::new());
+    let mut payload = Zeroizing::new(Vec::new());
     std::io::stdin()
-        .take(1024 * 1024 + 1)
-        .read_to_end(&mut expected)
+        .take((4 + MAX_COMMAND_BYTES + MAX_PASSWORD_BYTES + 1) as u64)
+        .read_to_end(&mut payload)
         .context("read clipboard ownership value")?;
-    if expected.len() > 1024 * 1024 {
-        bail!("clipboard ownership value is too large");
-    }
+    let (argv, expected) = helper_snapshot(&payload)?;
     std::thread::sleep(Duration::from_secs(after_secs));
 
-    let paths = Paths::load()?;
-    let command = read_clipboard_command(&paths)?;
-    let argv = parse_clipboard_command(&command)?;
     let current = Zeroizing::new(read_clipboard_value(&argv, expected.len() + 1)?);
-    if clipboard_is_still_owned(&current, &expected) {
+    if clipboard_is_still_owned(&current, expected) {
         clear_clipboard(&argv)?;
     }
     Ok(())
@@ -163,24 +253,8 @@ fn clipboard_is_still_owned(current: &[u8], expected: &[u8]) -> bool {
 }
 
 fn read_clipboard_value(argv: &[String], limit: usize) -> Result<Vec<u8>> {
-    let (program, args): (&str, Vec<String>) = match argv[0].as_str() {
-        "wl-copy" => ("wl-paste", vec!["--no-newline".into()]),
-        "pbcopy" => ("pbpaste", Vec::new()),
-        "termux-clipboard-set" => ("termux-clipboard-get", Vec::new()),
-        "xclip" => (
-            "xclip",
-            argv[1..].iter().cloned().chain(["-o".into()]).collect(),
-        ),
-        "xsel" => (
-            "xsel",
-            argv[1..]
-                .iter()
-                .cloned()
-                .chain(["--output".into()])
-                .collect(),
-        ),
-        other => bail!("clipboard ownership check is unsupported for {other}"),
-    };
+    let (reader, _) = expiry_commands(argv)?;
+    let (program, args) = reader.split_first().context("empty clipboard reader")?;
     let mut child = Command::new(program)
         .args(args)
         .stdin(Stdio::null())
@@ -204,9 +278,10 @@ fn read_clipboard_value(argv: &[String], limit: usize) -> Result<Vec<u8>> {
 }
 
 fn clear_clipboard(argv: &[String]) -> Result<()> {
+    let (_, clear) = expiry_commands(argv)?;
     if argv[0] == "wl-copy" {
         let status = Command::new("wl-copy")
-            .arg("--clear")
+            .args(&clear[1..])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -217,7 +292,7 @@ fn clear_clipboard(argv: &[String]) -> Result<()> {
         }
         Ok(())
     } else {
-        pipe_to_argv("", argv)
+        pipe_to_argv("", &clear)
     }
 }
 
@@ -320,7 +395,79 @@ pub fn parse_clipboard_command(command: &str) -> Result<Vec<String>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{clipboard_is_still_owned, validate_clear_timeout, MAX_CLEAR_TIMEOUT_SECS};
+    use super::*;
+
+    #[test]
+    fn expiry_preserves_supported_targets() {
+        for (copy, read, clear) in [
+            ("wl-copy", "wl-paste --no-newline", "wl-copy --clear"),
+            (
+                "wl-copy -p -s seat0",
+                "wl-paste --primary --seat seat0 --no-newline",
+                "wl-copy --primary --seat seat0 --clear",
+            ),
+            (
+                "wl-copy --primary --seat=seat1",
+                "wl-paste --primary --seat=seat1 --no-newline",
+                "wl-copy --primary --seat=seat1 --clear",
+            ),
+            (
+                "xclip -selection clipboard -display :1 -i",
+                "xclip -selection clipboard -display :1 -o",
+                "xclip -selection clipboard -display :1",
+            ),
+            (
+                "xsel --secondary --display :2 --input",
+                "xsel --secondary --display :2 --output",
+                "xsel --secondary --display :2",
+            ),
+            (
+                "pbcopy -pboard find",
+                "pbpaste -pboard find",
+                "pbcopy -pboard find",
+            ),
+            (
+                "termux-clipboard-set",
+                "termux-clipboard-get",
+                "termux-clipboard-set",
+            ),
+        ] {
+            let (reader, clearer) =
+                expiry_commands(&parse_clipboard_command(copy).unwrap()).unwrap();
+            assert_eq!(reader.join(" "), read);
+            assert_eq!(clearer.join(" "), clear);
+        }
+        for command in [
+            "wl-copy --type text/html",
+            "wl-copy --seat",
+            "wl-copy --seat=",
+            "xclip -selection unknown",
+            "xclip -display",
+            "xclip -o",
+            "xsel --display",
+            "xsel --keep",
+            "pbcopy -pboard unknown",
+            "clip",
+        ] {
+            assert!(
+                expiry_commands(&parse_clipboard_command(command).unwrap()).is_err(),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn helper_protocol_is_bounded_and_preserves_secret_bytes() {
+        let payload = helper_payload("secret\n\0", "wl-copy --primary").unwrap();
+        let (argv, expected) = helper_snapshot(&payload).unwrap();
+        assert_eq!(argv, ["wl-copy", "--primary"]);
+        assert_eq!(expected, b"secret\n\0");
+        assert!(helper_snapshot(&[0, 0, 0]).is_err());
+        assert!(helper_snapshot(&u32::MAX.to_le_bytes()).is_err());
+        assert!(helper_snapshot(&[5, 0, 0, 0, b'x']).is_err());
+        assert!(helper_payload("", &"x".repeat(MAX_COMMAND_BYTES + 1)).is_err());
+        assert!(helper_payload(&"x".repeat(MAX_PASSWORD_BYTES + 1), "wl-copy").is_err());
+    }
 
     #[test]
     fn clear_helper_only_clears_unchanged_secret() {

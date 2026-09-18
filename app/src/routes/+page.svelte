@@ -38,10 +38,47 @@
   let loadingMessage = $state("Loading ferusa...");
   let retryMessage = $state("");
   let setupMode = $state<"initial" | "replacement">("initial");
+  let hasPairing: boolean | null = null;
+  let lifecycleRevision = 0;
+
+  function clearSession() {
+    lifecycleRevision += 1;
+    isUnlocked = false;
+    pendingRequest = null;
+    queuedRequest = null;
+    retryMessage = "";
+    failReason = "";
+    setupMode = "initial";
+    // Keep initial enrollment mounted, including its current step and scanner.
+    screen = hasPairing === false ? "setup" : hasPairing ? "biometric" : "loading";
+  }
+
+  async function refreshSetup() {
+    const revision = ++lifecycleRevision;
+    try {
+      const paired = await invoke<boolean>("check_setup");
+      if (revision !== lifecycleRevision) return;
+      hasPairing = paired;
+      if (!paired) {
+        setupMode = "initial";
+        screen = "setup";
+      } else if (!isUnlocked) {
+        screen = "biometric";
+      }
+    } catch (e) {
+      if (revision !== lifecycleRevision) return;
+      console.error("check_setup failed:", formatInvokeError(e), e);
+      if (hasPairing !== true) screen = "setup";
+    }
+  }
 
   async function reconcilePendingRequest(): Promise<RequestPayload | null | undefined> {
+    const previousRequest = pendingRequest;
+    const revision = lifecycleRevision;
     try {
       const request = await invoke<RequestPayload | null>("pending_request");
+      // An event or lifecycle transition may have superseded this query.
+      if (revision !== lifecycleRevision || pendingRequest !== previousRequest) return undefined;
       if (request) {
         if (isUnlocked) {
           pendingRequest = request;
@@ -63,18 +100,14 @@
 
   async function syncForegroundState() {
     const foreground = document.visibilityState === "visible";
+    if (!foreground) clearSession();
+    const revision = ++lifecycleRevision;
     try {
       await invoke("set_app_foreground", { foreground });
     } catch (e) {
       console.error("foreground state update failed:", formatInvokeError(e), e);
     }
-    if (!foreground) {
-      isUnlocked = false;
-      pendingRequest = null;
-      queuedRequest = null;
-      retryMessage = "";
-      screen = "biometric";
-    }
+    if (revision === lifecycleRevision) await refreshSetup();
   }
 
   onMount(() => {
@@ -121,11 +154,8 @@
         const sessionExpiredUnlisten = await listen(
           "ferusa://session-expired",
           () => {
-            isUnlocked = false;
-            pendingRequest = null;
-            queuedRequest = null;
-            failReason = "";
-            screen = "biometric";
+            clearSession();
+            void refreshSetup();
           },
         );
         if (disposed) {
@@ -143,11 +173,8 @@
 
       try {
         const setupChangedUnlisten = await listen("ferusa://setup-changed", () => {
-          isUnlocked = false;
-          pendingRequest = null;
-          queuedRequest = null;
-          failReason = "";
-          screen = "biometric";
+          clearSession();
+          void refreshSetup();
         });
         if (disposed) {
           setupChangedUnlisten();
@@ -167,12 +194,7 @@
 
     const init = async () => {
       try {
-        const isSetup: boolean = await invoke("check_setup");
-        setupMode = "initial";
-        screen = isSetup ? "biometric" : "setup";
-      } catch (e) {
-        console.error("check_setup failed:", formatInvokeError(e), e);
-        screen = "setup";
+        await refreshSetup();
       } finally {
         window.clearTimeout(slowTimer);
         window.clearTimeout(verySlowTimer);
@@ -185,6 +207,7 @@
 
     return () => {
       disposed = true;
+      lifecycleRevision += 1;
       window.clearTimeout(slowTimer);
       window.clearTimeout(verySlowTimer);
       window.clearInterval(reconcileTimer);
@@ -195,11 +218,15 @@
   });
 
   function onSetupComplete() {
+    lifecycleRevision += 1;
+    hasPairing = true;
     setupMode = "initial";
     screen = "biometric";
   }
 
   function onUnlocked() {
+    if (document.visibilityState !== "visible" || hasPairing !== true) return;
+    lifecycleRevision += 1;
     isUnlocked = true;
 
     if (queuedRequest) {
@@ -212,31 +239,49 @@
   }
 
   function onLocked() {
-    isUnlocked = false;
-    screen = "biometric";
+    clearSession();
+    void refreshSetup();
   }
 
-  function onApproved() {
+  function isCurrentRequest(request: RequestPayload) {
+    return screen === "approve" && JSON.stringify(pendingRequest) === JSON.stringify(request);
+  }
+
+  function onApprovalLocked(request: RequestPayload) {
+    if (isCurrentRequest(request)) onLocked();
+  }
+
+  function onApproved(request: RequestPayload) {
+    if (!isCurrentRequest(request)) return;
     screen = "success";
   }
 
-  function onDenied() {
+  function onDenied(request: RequestPayload) {
+    if (!isCurrentRequest(request)) return;
     failReason = "";
     screen = "failed";
   }
 
-  async function onFailed(payload?: { reason: string }) {
+  async function onFailed(submittedRequest: RequestPayload, payload?: { reason: string }) {
+    if (!isCurrentRequest(submittedRequest)) return;
     const reason = payload?.reason ?? "Something went wrong. Please try again.";
-    const request = await reconcilePendingRequest();
+    let request: RequestPayload | null;
+    try {
+      request = await invoke<RequestPayload | null>("pending_request");
+    } catch {
+      if (isCurrentRequest(submittedRequest)) {
+        retryMessage = `${reason} Checking the pending request…`;
+      }
+      return;
+    }
+    if (!isCurrentRequest(submittedRequest)) return;
+    pendingRequest = request;
     if (request) {
-      retryMessage = reason;
+      retryMessage = JSON.stringify(request) === JSON.stringify(submittedRequest) ? reason : "";
       screen = "approve";
     } else if (request === null) {
       failReason = reason;
       screen = "failed";
-    } else {
-      retryMessage = `${reason} Checking the pending request…`;
-      screen = "approve";
     }
   }
 
@@ -247,10 +292,12 @@
   }
 
   function onReplace() {
+    lifecycleRevision += 1;
     screen = "replace";
   }
 
   function onReplacementAuthorized() {
+    lifecycleRevision += 1;
     setupMode = "replacement";
     pendingRequest = null;
     queuedRequest = null;
@@ -258,11 +305,13 @@
   }
 
   async function onReplacementCancel() {
+    const revision = ++lifecycleRevision;
     try {
       await invoke("cancel_pairing_replacement");
     } catch (e) {
       console.error("cancel_pairing_replacement failed:", formatInvokeError(e), e);
     }
+    if (revision !== lifecycleRevision) return;
     setupMode = "initial";
     screen = isUnlocked ? "idle" : "biometric";
   }
@@ -283,14 +332,16 @@
     <Reset onauthorized={onReplacementAuthorized} oncancel={onReplacementCancel} />
   {:else if screen === "approve"}
     {#if pendingRequest}
+      {#key JSON.stringify(pendingRequest)}
       <Approve
         request={pendingRequest}
         {retryMessage}
         onapproved={onApproved}
         ondenied={onDenied}
         onfailed={onFailed}
-        onlocked={onLocked}
+        onlocked={onApprovalLocked}
       />
+      {/key}
     {/if}
   {:else if screen === "success"}
     <Success request={pendingRequest} ondone={onResultDone} />

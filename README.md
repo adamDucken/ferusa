@@ -78,6 +78,11 @@ requires approval from the currently paired phone. Start `ferusa pair`, then cho
 active until the desktop vault has been re-encrypted with the new phone share and
 both devices have durably committed the replacement.
 
+If pairing is interrupted, keep the phone's pending setup and restart the desktop
+command to resume its recorded transaction. The phone refuses another setup while
+a generation is pending, because the desktop may already have prepared it. Do not
+reset the phone or remove its pairing data to bypass this recovery step.
+
 Common commands:
 
 ```bash
@@ -95,6 +100,12 @@ ferusa config set --clear-after 30 wl-copy
 
 Running `ferusa` without a subcommand opens the interactive shell. On Linux, vault
 data is normally stored below `~/.local/share/ferusa/`.
+
+Clipboard expiry retains the original command and target even if configuration
+changes. Supported targets include Wayland primary selection and seat, X11
+selection and display, and macOS pasteboard. Unknown or incompatible options
+still permit copying, but the CLI reports automatic clearing as unsupported.
+Clearing occurs only while the selected target still contains the copied password.
 
 ## Development checks
 

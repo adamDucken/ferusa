@@ -71,6 +71,39 @@ use peer::{
 #[cfg(target_os = "android")]
 use state::AppState;
 
+#[cfg(target_os = "android")]
+async fn is_referenced_pairing_peer<R: tauri::Runtime + 'static>(
+    app: &tauri::AppHandle<R>,
+    endpoint_id: PublicKey,
+) -> bool {
+    let state = app.state::<AppState>();
+    if state
+        .secrets
+        .lock()
+        .await
+        .as_ref()
+        .is_some_and(|secrets| endpoint_id.as_bytes() == &secrets.cli_node_id)
+    {
+        return true;
+    }
+    match tokio::time::timeout(
+        INBOUND_HANDSHAKE_TIMEOUT,
+        storage::is_referenced_pairing_cli_node_id_blocking(app.clone(), *endpoint_id.as_bytes()),
+    )
+    .await
+    {
+        Ok(Ok(referenced)) => referenced,
+        Ok(Err(e)) => {
+            warn!("[ferusa:app]: persisted peer classification failed: {e}");
+            false
+        }
+        Err(_) => {
+            warn!("[ferusa:app]: persisted peer classification timed out");
+            false
+        }
+    }
+}
+
 async fn resolve_iroh_secret_key<L, LFut, S, SFut>(
     mut load: L,
     mut store: S,
@@ -253,20 +286,16 @@ pub fn run() {
                     let inbound_peer_counts_c = inbound_peer_counts.clone();
                     let remote_addr = incoming.remote_addr();
                     let source = inbound_source_key(&remote_addr);
-                    let claims_active_peer = if let Some(endpoint_id) =
+                    let claims_referenced_peer = if let Some(endpoint_id) =
                         inbound_claimed_endpoint_id(&remote_addr)
                     {
-                        let state = app_handle.state::<AppState>();
-                        let secrets = state.secrets.lock().await;
-                        secrets.as_ref().is_some_and(|secrets| {
-                            endpoint_id.as_bytes() == &secrets.cli_node_id
-                        })
+                        is_referenced_pairing_peer(&app_handle, endpoint_id).await
                     } else {
                         false
                     };
                     // A relay supplies the authenticated endpoint id before the QUIC handshake.
                     // Do not let fresh identities consume the paired peer's source allowance.
-                    let source_permit = if claims_active_peer {
+                    let source_permit = if claims_referenced_peer {
                         None
                     } else {
                         match source_limiter.try_acquire(source.clone()) {
@@ -324,14 +353,9 @@ pub fn run() {
                         drop(handshake_permit);
 
                         let remote_id = conn.remote_id();
-                        let is_active_peer = {
-                            let state = app_handle_c.state::<AppState>();
-                            let secrets = state.secrets.lock().await;
-                            secrets
-                                .as_ref()
-                                .is_some_and(|secrets| remote_id.as_bytes() == &secrets.cli_node_id)
-                        };
-                        let handler_permit = if is_active_peer {
+                        let is_referenced_peer =
+                            is_referenced_pairing_peer(&app_handle_c, remote_id).await;
+                        let handler_permit = if is_referenced_peer {
                             paired_handlers_c.try_acquire_owned()
                         } else {
                             untrusted_handlers_c.try_acquire_owned()
@@ -342,7 +366,7 @@ pub fn run() {
                                 warn!(
                                     "[ferusa:app]: rejecting inbound connection from {}: {} handler capacity exhausted",
                                     remote_id,
-                                    if is_active_peer { "paired" } else { "untrusted" }
+                                    if is_referenced_peer { "paired" } else { "untrusted" }
                                 );
                                 conn.close(0u32.into(), b"connection handler capacity exhausted");
                                 return;
