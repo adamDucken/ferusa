@@ -52,6 +52,7 @@ impl TestContext {
         let mut cmd = ProcessCommand::new("script");
         cmd.args(["-qec", &parts.join(" "), "/dev/null"]);
         cmd.env("PATH", self.test_path());
+        cmd.env("NO_COLOR", "1");
         #[cfg(feature = "dev-2fa-stub")]
         cmd.env("FERUSA_ALLOW_DEV_2FA_STUB", "1");
         cmd
