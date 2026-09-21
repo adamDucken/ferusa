@@ -347,18 +347,17 @@ fn cleanup_retiring_generation<S: PairingStore>(store: &S) -> Result<()> {
         .context("clear retiring pairing generation")
 }
 
-fn cleanup_activation_metadata<S: PairingStore>(store: &S) -> Result<()> {
+fn cleanup_activation_metadata<S: PairingStore>(store: &S, pairing_id: uuid::Uuid) -> Result<()> {
     for key in [
         STAGING_PAIRING_GENERATION,
         PENDING_PAIRING_GENERATION,
         COMMITTED_PAIRING_GENERATION,
     ] {
-        store
-            .delete(key)
-            .with_context(|| format!("finalize activation by clearing {key}"))?;
-    }
-    for key in ["pin4_attempt_state", "pin6_attempt_state"] {
-        delete_entry_if_present(store, key);
+        if load_generation_id(store, key)? == Some(pairing_id) {
+            store
+                .delete(key)
+                .with_context(|| format!("finalize activation by clearing {key}"))?;
+        }
     }
     if let Err(e) = cleanup_retiring_generation(store) {
         warn!(
@@ -374,7 +373,7 @@ fn finalize_active_activation<S: PairingStore>(store: &S) -> Result<()> {
     let committed = load_generation_id(store, COMMITTED_PAIRING_GENERATION)?;
     match (active, committed) {
         (Some(active), Some(committed)) if active == committed => {
-            cleanup_activation_metadata(store)
+            cleanup_activation_metadata(store, active)
         }
         _ => Ok(()),
     }
@@ -606,7 +605,7 @@ fn activate_generation<S: PairingStore>(
     if load_generation_id(store, ACTIVE_PAIRING_GENERATION)? == Some(pairing_id) {
         let generation = load_metadata_validated_generation(store, pairing_id)
             .context("validate active generation")?;
-        cleanup_activation_metadata(store)?;
+        finalize_active_activation(store)?;
         return Ok(generation.into_stored_secrets());
     }
     let pending = load_generation_id(store, PENDING_PAIRING_GENERATION)?
@@ -631,8 +630,11 @@ fn activate_generation<S: PairingStore>(
         }
         save_generation_id(store, ACTIVE_PAIRING_GENERATION, committed)
             .context("activate pairing generation")?;
+        for key in ["pin4_attempt_state", "pin6_attempt_state"] {
+            delete_entry_if_present(store, key);
+        }
     }
-    cleanup_activation_metadata(store)?;
+    cleanup_activation_metadata(store, committed)?;
     Ok(generation.into_stored_secrets())
 }
 
@@ -1372,6 +1374,47 @@ mod tests {
             load_generation_id(&store, COMMITTED_PAIRING_GENERATION).unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn replayed_activation_preserves_newer_transaction_and_pin_attempts() {
+        let store = TestStore::default();
+        let active = activate_initial_generation(&store);
+        let replacement = uuid::Uuid::new_v4();
+        stage_and_commit(&store, replacement);
+        store.save("pin4_attempt_state", "four-attempts").unwrap();
+        store.save("pin6_attempt_state", "six-attempts").unwrap();
+
+        activate_generation(&store, active).unwrap();
+
+        assert_eq!(
+            load_generation_id(&store, STAGING_PAIRING_GENERATION).unwrap(),
+            Some(replacement)
+        );
+        assert_eq!(
+            load_generation_id(&store, PENDING_PAIRING_GENERATION).unwrap(),
+            Some(replacement)
+        );
+        assert_eq!(
+            load_generation_id(&store, COMMITTED_PAIRING_GENERATION).unwrap(),
+            Some(replacement)
+        );
+        assert_eq!(
+            store.get("pin4_attempt_state").unwrap().as_deref(),
+            Some("four-attempts")
+        );
+        assert_eq!(
+            store.get("pin6_attempt_state").unwrap().as_deref(),
+            Some("six-attempts")
+        );
+
+        activate_generation(&store, replacement).unwrap();
+        assert_eq!(
+            load_generation_id(&store, ACTIVE_PAIRING_GENERATION).unwrap(),
+            Some(replacement)
+        );
+        assert!(store.get("pin4_attempt_state").unwrap().is_none());
+        assert!(store.get("pin6_attempt_state").unwrap().is_none());
     }
 
     #[test]
