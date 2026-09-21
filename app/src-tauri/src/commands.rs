@@ -1,6 +1,7 @@
 use anyhow::Context;
 use log::{debug, error, info, warn};
 use rand::Rng;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tauri::{command, AppHandle, Emitter, Manager, Runtime, State};
@@ -104,6 +105,21 @@ const AUTH_SESSION_TTL: Duration = Duration::from_secs(10 * 60);
 const PAIRING_REPLACEMENT_AUTHORIZATION_TTL: Duration = AUTH_SESSION_TTL;
 const APPROVAL_KEY_AUTH_TTL: Duration = Duration::from_secs(120);
 const PENDING_REQUEST_TTL: Duration = Duration::from_secs(65);
+// Refuse excess requests instead of evicting IDs that could still be replayed.
+const MAX_RECENT_REQUEST_IDS: usize = 4096;
+
+fn remember_request_id(
+    recent: &mut HashMap<uuid::Uuid, Instant>,
+    request_id: uuid::Uuid,
+    now: Instant,
+) -> bool {
+    recent.retain(|_, seen_at| now.saturating_duration_since(*seen_at) < AUTH_SESSION_TTL);
+    if recent.contains_key(&request_id) || recent.len() >= MAX_RECENT_REQUEST_IDS {
+        return false;
+    }
+    recent.insert(request_id, now);
+    true
+}
 
 fn pin_retry_limit_reached(failed_attempts: u8) -> bool {
     failed_attempts >= PIN_FAILURES_BEFORE_COOLDOWN
@@ -215,11 +231,12 @@ fn existing_setup_requires_replacement_authorization(
 }
 
 fn pending_request_is_expired(
-    pending_request_id: &str,
-    expected_request_id: &str,
-    created_at: Instant,
+    pending_identity: PendingIdentity,
+    expected_identity: PendingIdentity,
+    now: Instant,
 ) -> bool {
-    pending_request_id == expected_request_id && created_at.elapsed() >= PENDING_REQUEST_TTL
+    pending_identity == expected_identity
+        && now.saturating_duration_since(pending_identity.created_at) >= PENDING_REQUEST_TTL
 }
 
 fn pairing_generation_matches(expected: uuid::Uuid, actual: uuid::Uuid) -> bool {
@@ -406,17 +423,13 @@ async fn take_and_deny_expired_pending<R: Runtime + 'static>(
     app: AppHandle<R>,
     pending: &PendingReq,
     approval_alias: Option<String>,
-    expected_request_id: &str,
+    expected_identity: PendingIdentity,
     reason: &str,
 ) {
     let pending_req = {
         let mut slot = pending.lock().await;
         if slot.as_ref().is_some_and(|pending_req| {
-            pending_request_is_expired(
-                &pending_req.request.request_id.to_string(),
-                expected_request_id,
-                pending_req.created_at,
-            )
+            pending_request_is_expired(pending_req.identity, expected_identity, Instant::now())
         }) {
             slot.take()
         } else {
@@ -438,7 +451,7 @@ async fn take_and_deny_expired_pending<R: Runtime + 'static>(
 fn schedule_pending_expiry<R: Runtime + 'static>(
     app_handle: AppHandle<R>,
     pending: PendingReq,
-    request_id: String,
+    identity: PendingIdentity,
 ) {
     tauri::async_runtime::spawn(async move {
         tokio::time::sleep(PENDING_REQUEST_TTL).await;
@@ -449,7 +462,7 @@ fn schedule_pending_expiry<R: Runtime + 'static>(
             app_handle.clone(),
             &pending,
             approval_alias,
-            &request_id,
+            identity,
             "pending_request_expiry",
         )
         .await;
@@ -639,14 +652,81 @@ async fn verify_pin_with_cooldown<R: Runtime + 'static>(
 // We store the SendStream to write the response on the correct stream. Keep it
 // pending until approval, denial, or retry exhaustion so the CLI always receives
 // a terminal response instead of waiting for a timeout.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PendingIdentity {
+    request_id: uuid::Uuid,
+    // Server-generated per instance; the request contents never change after admission.
+    instance_id: uuid::Uuid,
+    session_generation: u64,
+    created_at: Instant,
+}
+
+impl PendingIdentity {
+    fn is_current(self, expected: Self, now: Instant) -> bool {
+        self == expected && now.saturating_duration_since(self.created_at) < PENDING_REQUEST_TTL
+    }
+}
+
 pub struct PendingRequest {
     request: AuthRequest,
     send: iroh::endpoint::SendStream,
     conn: iroh::endpoint::Connection,
-    created_at: Instant,
+    identity: PendingIdentity,
 }
 
 pub type PendingReq = Arc<Mutex<Option<PendingRequest>>>;
+
+async fn take_verified_pending(
+    state: &AppState,
+    pending: &PendingReq,
+    expected: PendingIdentity,
+) -> Result<PendingRequest> {
+    let generation = state.session_generation.lock().await;
+    if *generation != expected.session_generation || !state.is_foreground() {
+        return Err(AppError::SessionExpired);
+    }
+    if !state
+        .unlocked_at
+        .lock()
+        .await
+        .as_ref()
+        .copied()
+        .is_some_and(auth_session_is_current)
+    {
+        return Err(AppError::SessionExpired);
+    }
+    let mut slot = pending.lock().await;
+    let current = slot
+        .as_ref()
+        .ok_or(AppError::PendingRequest { kind: "missing" })?;
+    if current.request.request_id != expected.request_id
+        || !current.identity.is_current(expected, Instant::now())
+    {
+        return Err(AppError::PendingRequest { kind: "mismatch" });
+    }
+    Ok(slot.take().expect("verified pending request exists"))
+}
+
+async fn restore_pending_after_sign_error(
+    state: &AppState,
+    pending: &PendingReq,
+    pending_req: PendingRequest,
+) {
+    let generation = state.session_generation.lock().await;
+    if *generation == pending_req.identity.session_generation
+        && state.is_foreground()
+        && pending_req
+            .identity
+            .is_current(pending_req.identity, Instant::now())
+    {
+        let mut slot = pending.lock().await;
+        if slot.is_none() {
+            *slot = Some(pending_req);
+            return;
+        }
+    }
+    debug!("[ferusa:app]: discarding superseded pending request after sign error");
+}
 
 fn biometric_prompt_title(reason: &str) -> String {
     format!("{reason} ferusa vault")
@@ -1075,26 +1155,45 @@ pub async fn serve_connection<R: Runtime + 'static>(
                 info!("[ferusa:app]: received AuthRequest id={}", req.request_id);
                 debug!("[ferusa:app]: storing pending request...");
                 let mut incoming_send = Some(send);
+                let state = app_handle.state::<AppState>();
+                let generation = state.session_generation.lock().await;
+                if !state.is_foreground() {
+                    conn.close(0u32.into(), b"expired auth session");
+                    break;
+                }
+                let identity = PendingIdentity {
+                    request_id: req.request_id,
+                    instance_id: uuid::Uuid::new_v4(),
+                    session_generation: *generation,
+                    created_at: Instant::now(),
+                };
+                let mut reused_id = false;
                 let existing_request_id = {
                     let mut slot = pending.lock().await;
                     if let Some(existing) = slot.as_ref() {
                         Some(existing.request.request_id)
                     } else {
-                        *slot = Some(PendingRequest {
-                            request: req.clone(),
-                            send: incoming_send
-                                .take()
-                                .expect("incoming send stream is available"),
-                            conn: conn.clone(),
-                            created_at: Instant::now(),
-                        });
+                        let mut recent = state.recent_request_ids.lock().await;
+                        if remember_request_id(&mut recent, req.request_id, identity.created_at) {
+                            *slot = Some(PendingRequest {
+                                request: req.clone(),
+                                send: incoming_send
+                                    .take()
+                                    .expect("incoming send stream is available"),
+                                conn: conn.clone(),
+                                identity,
+                            });
+                        } else {
+                            reused_id = true;
+                        }
                         None
                     }
                 };
+                drop(generation);
 
-                if let Some(existing_request_id) = existing_request_id {
+                if reused_id || existing_request_id.is_some() {
                     warn!(
-                        "[ferusa:app]: rejecting concurrent AuthRequest id={} while id={} is pending",
+                        "[ferusa:app]: rejecting AuthRequest id={}: reused id or pending id={:?}",
                         req.request_id, existing_request_id
                     );
                     //NOTE: Ferusa intentionally allows only one live security prompt because the desktop UI, the pending request slot,
@@ -1117,7 +1216,7 @@ pub async fn serve_connection<R: Runtime + 'static>(
                         )
                         .await
                         {
-                            error!("[ferusa:app]: concurrent request denial send failed: {}", e);
+                            error!("[ferusa:app]: rejected request denial send failed: {}", e);
                         }
                     } else {
                         warn!(
@@ -1127,11 +1226,7 @@ pub async fn serve_connection<R: Runtime + 'static>(
                     continue;
                 }
                 debug!("[ferusa:app]: pending request stored");
-                schedule_pending_expiry(
-                    app_handle.clone(),
-                    pending.clone(),
-                    req.request_id.to_string(),
-                );
+                schedule_pending_expiry(app_handle.clone(), pending.clone(), identity);
 
                 let payload = PendingRequestPayload::from(&req);
                 debug!(
@@ -1144,9 +1239,10 @@ pub async fn serve_connection<R: Runtime + 'static>(
                     error!("[ferusa:app]: emit error: {}", e);
                     let hidden_request = {
                         let mut slot = pending.lock().await;
-                        if slot.as_ref().is_some_and(|pending_req| {
-                            pending_req.request.request_id == req.request_id
-                        }) {
+                        if slot
+                            .as_ref()
+                            .is_some_and(|pending_req| pending_req.identity == identity)
+                        {
                             slot.take()
                         } else {
                             None
@@ -1794,7 +1890,7 @@ pub async fn approve_request<R: Runtime>(
     )
     .await?;
 
-    let (pin_kind, expected_len) = {
+    let (pin_kind, expected_len, identity) = {
         let pend = pending.lock().await;
         let pending_req = pend.as_ref().ok_or_else(|| {
             warn!("[ferusa:app]: approve_request: no pending request found");
@@ -1809,12 +1905,18 @@ pub async fn approve_request<R: Runtime>(
             );
             return Err(AppError::PendingRequest { kind: "mismatch" });
         }
+        if !pending_req
+            .identity
+            .is_current(pending_req.identity, Instant::now())
+        {
+            return Err(AppError::PendingRequest { kind: "mismatch" });
+        }
         debug!("[ferusa:app]: approve_request: request_id matched");
 
         let pin_kind = pin_kind_for_action(pending_req.request.action);
         let expected_len = expected_pin_len(pin_kind);
 
-        (pin_kind, expected_len)
+        (pin_kind, expected_len, pending_req.identity)
     };
 
     let (approval_alias, pin_hash) = {
@@ -1849,25 +1951,8 @@ pub async fn approve_request<R: Runtime>(
     if let PinVerificationOutcome::CooldownActive { retry_after_ms } = pin_outcome {
         ensure_approval_key_auth(&app, state.inner(), "Deny").await?;
 
-        let mut pending_req = {
-            let mut pend = pending.lock().await;
-            let pending_req = pend.as_ref().ok_or_else(|| {
-                warn!(
-                    "[ferusa:app]: approve_request: no pending request found during active cooldown"
-                );
-                AppError::PendingRequest { kind: "missing" }
-            })?;
-
-            if pending_req.request.request_id.to_string() != payload.request_id {
-                error!(
-                    "[ferusa:app]: request_id mismatch during active cooldown: expected={} got={}",
-                    pending_req.request.request_id, payload.request_id
-                );
-                return Err(AppError::PendingRequest { kind: "mismatch" });
-            }
-
-            pend.take().expect("pending request existed")
-        };
+        let mut pending_req =
+            take_verified_pending(state.inner(), pending.inner(), identity).await?;
 
         warn!("[ferusa:app]: approve_request: PIN cooldown active; denying request");
         if let Err(e) = send_signed_response(
@@ -1883,7 +1968,7 @@ pub async fn approve_request<R: Runtime>(
             error!("[ferusa:app]: active-cooldown denial send failed: {}", e);
             let err = handle_signed_response_error(state.inner(), e).await;
             if matches!(err, AppError::ApprovalKeyAuthRequired { .. }) {
-                *pending.lock().await = Some(pending_req);
+                restore_pending_after_sign_error(state.inner(), pending.inner(), pending_req).await;
             }
             return Err(err);
         }
@@ -1907,23 +1992,8 @@ pub async fn approve_request<R: Runtime>(
     if let PinVerificationOutcome::CooldownStarted { retry_after_ms } = pin_outcome {
         ensure_approval_key_auth(&app, state.inner(), "Deny").await?;
 
-        let mut pending_req = {
-            let mut pend = pending.lock().await;
-            let pending_req = pend.as_ref().ok_or_else(|| {
-                warn!("[ferusa:app]: approve_request: no pending request found after PIN check");
-                AppError::PendingRequest { kind: "missing" }
-            })?;
-
-            if pending_req.request.request_id.to_string() != payload.request_id {
-                error!(
-                    "[ferusa:app]: request_id mismatch after PIN check: expected={} got={}",
-                    pending_req.request.request_id, payload.request_id
-                );
-                return Err(AppError::PendingRequest { kind: "mismatch" });
-            }
-
-            pend.take().expect("pending request existed")
-        };
+        let mut pending_req =
+            take_verified_pending(state.inner(), pending.inner(), identity).await?;
 
         warn!("[ferusa:app]: approve_request: PIN cooldown started; denying request");
         if let Err(e) = send_signed_response(
@@ -1939,7 +2009,7 @@ pub async fn approve_request<R: Runtime>(
             error!("[ferusa:app]: retry-limit denial send failed: {}", e);
             let err = handle_signed_response_error(state.inner(), e).await;
             if matches!(err, AppError::ApprovalKeyAuthRequired { .. }) {
-                *pending.lock().await = Some(pending_req);
+                restore_pending_after_sign_error(state.inner(), pending.inner(), pending_req).await;
             }
             return Err(err);
         }
@@ -1956,23 +2026,7 @@ pub async fn approve_request<R: Runtime>(
     debug!("[ferusa:app]: approve_request: PIN verified successfully");
     ensure_approval_key_auth(&app, state.inner(), "Approve").await?;
 
-    let mut pending_req = {
-        let mut pend = pending.lock().await;
-        let pending_req = pend.as_ref().ok_or_else(|| {
-            warn!("[ferusa:app]: approve_request: no pending request found before approval send");
-            AppError::PendingRequest { kind: "missing" }
-        })?;
-
-        if pending_req.request.request_id.to_string() != payload.request_id {
-            error!(
-                "[ferusa:app]: request_id mismatch before approval send: expected={} got={}",
-                pending_req.request.request_id, payload.request_id
-            );
-            return Err(AppError::PendingRequest { kind: "mismatch" });
-        }
-
-        pend.take().expect("pending request existed")
-    };
+    let mut pending_req = take_verified_pending(state.inner(), pending.inner(), identity).await?;
     debug!("[ferusa:app]: approve_request: took ownership of pending request");
 
     if !state.is_foreground() {
@@ -1987,7 +2041,9 @@ pub async fn approve_request<R: Runtime>(
         let secrets_guard = state.secrets.lock().await;
         let Some(secrets) = secrets_guard.as_ref() else {
             warn!("[ferusa:app]: approve_request: app is locked before unlock-share copy");
-            *pending.lock().await = Some(pending_req);
+            pending_req
+                .conn
+                .close(0u32.into(), b"app locked before approval");
             return Err(AppError::PendingRequest { kind: "locked" });
         };
         Some(Zeroizing::new(secrets.phone_share))
@@ -1995,6 +2051,13 @@ pub async fn approve_request<R: Runtime>(
         None
     };
     let unlock_share = phone_share.as_ref().map(|share| &**share);
+
+    if !pending_req.identity.is_current(identity, Instant::now()) {
+        pending_req
+            .conn
+            .close(0u32.into(), b"pending request expired");
+        return Err(AppError::PendingRequest { kind: "mismatch" });
+    }
 
     debug!("[ferusa:app]: sending approval response");
     if let Err(e) = send_signed_response(
@@ -2010,7 +2073,7 @@ pub async fn approve_request<R: Runtime>(
         error!("[ferusa:app]: send_response failed: {}", e);
         let err = handle_signed_response_error(state.inner(), e).await;
         if matches!(err, AppError::ApprovalKeyAuthRequired { .. }) {
-            *pending.lock().await = Some(pending_req);
+            restore_pending_after_sign_error(state.inner(), pending.inner(), pending_req).await;
         }
         return Err(err);
     }
@@ -2030,10 +2093,11 @@ mod tests {
         existing_setup_requires_replacement_authorization, pairing_generation_matches,
         pairing_replacement_authorization_is_current, pending_request_is_expired,
         pin_retry_limit_reached, record_pin_failure_state, remaining_unauthenticated_timeout,
-        run_argon2_job, sanitize_request_display_field, send_pong, AppState, PendingRequestPayload,
-        PinKind, PinVerificationOutcome, APPROVAL_KEY_AUTH_TTL, AUTH_SESSION_TTL,
-        PAIRING_REPLACEMENT_AUTHORIZATION_TTL, PENDING_REQUEST_TTL, PIN_FAILURES_BEFORE_COOLDOWN,
-        REQUEST_DISPLAY_FIELD_MAX_CHARS,
+        remember_request_id, run_argon2_job, sanitize_request_display_field, send_pong,
+        take_verified_pending, AppState, PendingIdentity, PendingReq, PendingRequest,
+        PendingRequestPayload, PinKind, PinVerificationOutcome, APPROVAL_KEY_AUTH_TTL,
+        AUTH_SESSION_TTL, PAIRING_REPLACEMENT_AUTHORIZATION_TTL, PENDING_REQUEST_TTL,
+        PIN_FAILURES_BEFORE_COOLDOWN, REQUEST_DISPLAY_FIELD_MAX_CHARS,
     };
     use crate::peer::{AppPeer, INBOUND_FRAME_TIMEOUT};
     use crate::storage::PinAttemptState;
@@ -2041,6 +2105,7 @@ mod tests {
     use ferusa_core::transport::{FerusaMessage, FERUSA_ALPN};
     use ferusa_core::types::VaultAction;
     use std::{
+        collections::HashMap,
         sync::{
             atomic::{AtomicUsize, Ordering},
             Arc,
@@ -2447,12 +2512,151 @@ mod tests {
 
     #[test]
     fn pending_expiry_only_matches_same_request_after_ttl() {
-        let fresh = Instant::now();
-        let expired = Instant::now() - PENDING_REQUEST_TTL - Duration::from_secs(1);
+        let now = Instant::now();
+        let identity = PendingIdentity {
+            request_id: uuid::Uuid::new_v4(),
+            instance_id: uuid::Uuid::new_v4(),
+            session_generation: 1,
+            created_at: now,
+        };
+        let replacement = PendingIdentity {
+            instance_id: uuid::Uuid::new_v4(),
+            ..identity
+        };
 
-        assert!(!pending_request_is_expired("req-1", "req-1", fresh));
-        assert!(!pending_request_is_expired("req-1", "req-2", expired));
-        assert!(pending_request_is_expired("req-1", "req-1", expired));
+        assert!(!pending_request_is_expired(identity, identity, now));
+        assert!(!pending_request_is_expired(
+            replacement,
+            identity,
+            now + PENDING_REQUEST_TTL
+        ));
+        assert!(pending_request_is_expired(
+            identity,
+            identity,
+            now + PENDING_REQUEST_TTL
+        ));
+        assert!(!identity.is_current(identity, now + PENDING_REQUEST_TTL));
+        assert!(!replacement.is_current(identity, now));
+    }
+
+    #[test]
+    fn request_id_reuse_is_rejected_during_session_lifetime() {
+        let mut recent = HashMap::new();
+        let now = Instant::now();
+        let id = uuid::Uuid::new_v4();
+
+        assert!(remember_request_id(&mut recent, id, now));
+        assert!(!remember_request_id(
+            &mut recent,
+            id,
+            now + PENDING_REQUEST_TTL
+        ));
+        assert!(remember_request_id(&mut recent, id, now + AUTH_SESSION_TTL));
+    }
+
+    #[tokio::test]
+    async fn expired_read_verification_cannot_take_same_id_write_request() {
+        let state = AppState::new();
+        state.set_foreground(true).await;
+        *state.unlocked_at.lock().await = Some(Instant::now());
+
+        let phone_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+            .alpns(vec![FERUSA_ALPN.to_vec()])
+            .bind()
+            .await
+            .unwrap();
+        let cli_endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+            .alpns(vec![FERUSA_ALPN.to_vec()])
+            .bind()
+            .await
+            .unwrap();
+        let accepting = {
+            let endpoint = phone_endpoint.clone();
+            tokio::spawn(async move {
+                endpoint
+                    .accept()
+                    .await
+                    .unwrap()
+                    .accept()
+                    .unwrap()
+                    .await
+                    .unwrap()
+            })
+        };
+        let cli_conn = cli_endpoint
+            .connect(phone_endpoint.addr(), FERUSA_ALPN)
+            .await
+            .unwrap();
+        let phone_conn = accepting.await.unwrap();
+
+        let request = AuthRequest {
+            pairing_id: uuid::Uuid::new_v4(),
+            request_id: uuid::Uuid::new_v4(),
+            correlation_code: 1234,
+            action: VaultAction::Read,
+            entry_title: Some("entry".into()),
+            unlock_share_requested: false,
+            timestamp: 42,
+        };
+        let read_identity = PendingIdentity {
+            request_id: request.request_id,
+            instance_id: uuid::Uuid::new_v4(),
+            session_generation: *state.session_generation.lock().await,
+            created_at: Instant::now() - PENDING_REQUEST_TTL - Duration::from_secs(1),
+        };
+        let (mut cli_send, _) = cli_conn.open_bi().await.unwrap();
+        cli_send.write_all(b"read").await.unwrap();
+        cli_send.finish().unwrap();
+        let (read_send, _) = phone_conn.accept_bi().await.unwrap();
+        let pending: PendingReq = Arc::new(Mutex::new(Some(PendingRequest {
+            request: request.clone(),
+            send: read_send,
+            conn: phone_conn.clone(),
+            identity: read_identity,
+        })));
+
+        // PIN verification is suspended while expiry removes the read instance.
+        let expired = pending.lock().await.take();
+        drop(expired);
+        let write_identity = PendingIdentity {
+            instance_id: uuid::Uuid::new_v4(),
+            created_at: Instant::now(),
+            ..read_identity
+        };
+        let (mut cli_send, _) = cli_conn.open_bi().await.unwrap();
+        cli_send.write_all(b"write").await.unwrap();
+        cli_send.finish().unwrap();
+        let (write_send, _) = phone_conn.accept_bi().await.unwrap();
+        *pending.lock().await = Some(PendingRequest {
+            request: AuthRequest {
+                action: VaultAction::Update,
+                unlock_share_requested: true,
+                timestamp: 43,
+                ..request
+            },
+            send: write_send,
+            conn: phone_conn,
+            identity: write_identity,
+        });
+
+        assert!(take_verified_pending(&state, &pending, read_identity)
+            .await
+            .is_err());
+        let slot = pending.lock().await;
+        let replacement = slot.as_ref().unwrap();
+        assert_eq!(replacement.identity, write_identity);
+        assert_eq!(replacement.request.action, VaultAction::Update);
+        assert!(replacement.request.unlock_share_requested);
+        drop(slot);
+        state.lock().await;
+        assert!(take_verified_pending(&state, &pending, write_identity)
+            .await
+            .is_err());
+        drop(pending.lock().await.take());
+
+        cli_conn.close(0u32.into(), b"test complete");
+        cli_endpoint.close().await;
+        phone_endpoint.close().await;
     }
 
     #[test]

@@ -1,5 +1,6 @@
 use crate::error::{AppError, Result};
 use log::{debug, info};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -147,6 +148,7 @@ pub struct AppState {
     pub approval_key_authenticated_at: Arc<Mutex<Option<Instant>>>,
     pub setup_pairing_code: Arc<Mutex<Option<u16>>>,
     pub session_generation: Arc<Mutex<u64>>,
+    pub recent_request_ids: Mutex<HashMap<uuid::Uuid, Instant>>,
     is_foreground: Arc<AtomicBool>,
     replacement_generation: AtomicU64,
     pin4_attempt_gate: Arc<Mutex<()>>,
@@ -166,6 +168,7 @@ impl AppState {
             approval_key_authenticated_at: Arc::new(Mutex::new(None)),
             setup_pairing_code: Arc::new(Mutex::new(None)),
             session_generation: Arc::new(Mutex::new(0)),
+            recent_request_ids: Mutex::new(HashMap::new()),
             is_foreground: Arc::new(AtomicBool::new(false)),
             replacement_generation: AtomicU64::new(0),
             pin4_attempt_gate: Arc::new(Mutex::new(())),
