@@ -122,6 +122,23 @@ mod tests {
         // Replacement cancellation does not invalidate the live session timer.
         assert_eq!(*state.session_generation.lock().await, session);
     }
+
+    #[tokio::test]
+    async fn background_preserves_initial_enrollment_code() {
+        let state = AppState::new();
+        state.set_foreground(true).await;
+        *state.setup_pairing_code.lock().await = Some(1234);
+
+        state.set_foreground(false).await;
+        state.lock().await; // set_app_foreground also expires the session.
+        state.set_foreground(true).await;
+
+        assert_eq!(*state.setup_pairing_code.lock().await, Some(1234));
+
+        *state.is_setup.lock().await = true;
+        state.lock().await;
+        assert!(state.setup_pairing_code.lock().await.is_none());
+    }
 }
 
 #[derive(ZeroizeOnDrop)]
@@ -213,7 +230,11 @@ impl AppState {
         *self.pairing_replacement_authorized_at.lock().await = None;
         *self.unlocked_at.lock().await = None;
         *self.approval_key_authenticated_at.lock().await = None;
-        *self.setup_pairing_code.lock().await = None;
+        // Initial enrollment stays mounted across backgrounding. Its displayed
+        // verification code must remain valid until setup consumes it.
+        if *self.is_setup.lock().await {
+            *self.setup_pairing_code.lock().await = None;
+        }
         debug!("[ferusa:app]: AppState::lock secrets cleared");
     }
 
