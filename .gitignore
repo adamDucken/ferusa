@@ -10,6 +10,7 @@ peer.id
 !.env.example
 review.md
 AGENTS.md
+.agents
 # Generated build outputs
 **/build/
 **/.gradle/
